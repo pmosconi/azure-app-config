@@ -106,6 +106,14 @@ without a real reason recorded in the commit message.
 - **The label is its own variable, never derived from `NODE_ENV`.** Images bake
   `ENV NODE_ENV=production`, so a staging container would read the production label and hit
   production databases.
+- **The diagnostics stop at the access-key path, and that is accepted.** With no token there is
+  no second in-process signal, so a provider that stopped honouring `clientOptions` and a
+  genuinely silent failure are indistinguishable there; `detail` says the cause is unreported
+  rather than picking one. That path exists for a run with no identity to borrow — a developer
+  machine, since a store with local auth disabled puts every deployed consumer on the endpoint
+  path, where the credential watch works. The failure surfaces to someone already reading the
+  stack trace, not to a container answering 503 at four in the morning. Do not file this as a
+  defect; closing it means a new signal for the one path carrying no production traffic.
 - **Precedence inverts under `NODE_ENV=development` only.** Store wins everywhere else, so a
   stale app setting cannot beat a migrated value. Safe precisely because no deployed container
   can take the development branch.

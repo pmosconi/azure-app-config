@@ -169,7 +169,11 @@ describe('the failure the provider discards', () => {
     expect(error.detail).not.toContain('unreachable');
   });
 
-  it('names nothing on the access-key path, where no token is in play', async () => {
+  it('names nothing on the access-key path, where no token is in play (accepted)', async () => {
+    // This is the diagnostics' accepted stopping point, not a gap waiting to be closed. With no
+    // token there is no second signal, so drift and a silent failure look alike here — and the
+    // path exists for a run with no identity to borrow, which in practice is a developer machine.
+    // Deployed consumers are all on the endpoint path, where the watch works.
     process.env.APP_CONFIG_CONNECTION_STRING = 'Endpoint=https://example.invalid;Id=x;Secret=c2VjcmV0';
     loadMock.mockImplementation(failingLoadWithNoRequest(providerTimeoutError()) as never);
 

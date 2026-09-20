@@ -391,6 +391,12 @@ function explain(
  */
 function attributeSilence(credential: CredentialEvidence | undefined): string {
   if (credential === undefined) {
+    // Accepted limit, not an oversight: on the access-key path there is no token, so drift and a
+    // genuinely silent failure are indistinguishable and this says so rather than picking one.
+    // Closing it would need a second in-process signal for the one path that carries no
+    // production traffic — a store with local auth disabled leaves every deployed consumer on
+    // the endpoint path, and this one reaching a developer who can re-read the stack trace,
+    // rather than a container answering 503 at four in the morning.
     return '(no request was observed, and no token was in play on this path, so the cause is unreported)';
   }
   if (!credential.requested) {
