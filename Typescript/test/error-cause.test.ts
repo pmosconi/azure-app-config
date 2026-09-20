@@ -11,6 +11,7 @@ import { load } from '@azure/app-configuration-provider';
 import { ConfigInputError, ConfigLoadError, hydrate, resetHydration } from '../src/index';
 import {
   KEYS,
+  fakeStore,
   failingLoad,
   failingLoadWithNoRequest,
   providerArgumentError,
@@ -18,6 +19,7 @@ import {
   providerKeyVaultError,
   providerNonFailoverableError,
   providerTimeoutError,
+  policiesFrom,
   restError,
   restoreEnv,
   snapshotEnv,
@@ -203,5 +205,34 @@ describe('input errors from the provider', () => {
     expect(error).toBeInstanceOf(ConfigInputError);
     expect(error).not.toBeInstanceOf(ConfigLoadError);
     expect((error as Error).message).toContain('Invalid selector.');
+  });
+});
+
+/**
+ * Our half of the contract with the provider. The other half — that `clientOptions` is still
+ * honoured and that `perRetry` still sits below the SDK's retry policy — cannot be checked with
+ * `load()` mocked, and is covered by test/provider-contract.integration.test.ts.
+ */
+describe('how the diagnostics policy is handed to the provider', () => {
+  it('sends exactly one policy, positioned below the retry policy', async () => {
+    loadMock.mockResolvedValue(fakeStore() as never);
+
+    await hydrate({ keys: KEYS });
+
+    const policies = policiesFrom(loadMock.mock.calls[0] as unknown[]);
+    expect(policies).toHaveLength(1);
+    // `perCall` would sit ABOVE the SDK's retry policy and see one attempt per call rather than
+    // one per try, which is fewer observations for exactly the failures that get retried.
+    expect(policies[0]!.position).toBe('perRetry');
+    expect(policies[0]!.policy.name).toBe('actvalue-azure-app-config-diagnostics');
+  });
+
+  it('sends it on the access-key path too', async () => {
+    process.env.APP_CONFIG_CONNECTION_STRING = 'Endpoint=https://example.invalid;Id=x;Secret=c2VjcmV0';
+    loadMock.mockResolvedValue(fakeStore() as never);
+
+    await hydrate({ keys: KEYS });
+
+    expect(policiesFrom(loadMock.mock.calls[0] as unknown[])).toHaveLength(1);
   });
 });

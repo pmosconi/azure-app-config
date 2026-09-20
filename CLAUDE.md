@@ -22,7 +22,8 @@ container consumer, then `1.0.0`. Python follows. See **Status** below.
 ```bash
 make install          # both languages
 make test             # both
-make test-ts          # vitest
+make test-ts          # vitest, unit
+make test-integration-ts  # real provider, no Azure — see below
 make lint-ts
 make build-ts         # tsup → dist/, esm + cjs + dts
 make publish-ts       # npm publish (prepublishOnly builds)
@@ -98,6 +99,13 @@ without a real reason recorded in the commit message.
 - **Error fixtures must match the provider's real shape**, which `test/helpers.ts` records with
   source line numbers. A fixture easier to unwrap than reality certifies the bug it was written
   to catch.
+- **The provider's half of the contract gets a real test.** `load()` is mocked everywhere else,
+  so nothing in the unit run would notice a provider upgrade that dropped or renamed
+  `clientOptions` — every test would stay green while `detail` fell through to the
+  no-observations branch and reported a 403 as an unreachable store. One integration test
+  (`test/*.integration.test.ts`, its own config, excluded from `npm test`) runs the real `load()`
+  against an RFC 2606 `.invalid` endpoint and asserts at least one observation. It needs no
+  Azure, credentials or egress.
 - Public API stays small and additive. Pre-1.0 it can change; after 1.0 a change to any of the
   four invariants is a major.
 - Keep the two implementations behaviourally identical. Same option names in snake_case, same

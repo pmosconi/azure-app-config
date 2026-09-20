@@ -1,11 +1,12 @@
-.PHONY: help install-ts install-py test-ts test-py lint-ts lint-py typecheck-ts typecheck-py format-py build-ts build-py publish-ts publish-py publish-py-test pack-ts clean venv-py install test lint
+.PHONY: help install-ts install-py test-ts test-integration-ts test-py lint-ts lint-py typecheck-ts typecheck-py format-py build-ts build-py publish-ts publish-py publish-py-test pack-ts clean venv-py install test lint
 
 help:
 	@echo "Available commands:"
 	@echo "  make install-ts         - Install TypeScript dependencies"
 	@echo "  make install-py         - Install Python dependencies"
 	@echo "  make install            - Install all dependencies"
-	@echo "  make test-ts            - Run TypeScript tests"
+	@echo "  make test-ts            - Run TypeScript unit tests"
+	@echo "  make test-integration-ts - Run TypeScript tests against the real provider (no Azure needed)"
 	@echo "  make test-py            - Run Python unit tests"
 	@echo "  make test               - Run all tests"
 	@echo "  make lint-ts            - Lint TypeScript code"
@@ -28,6 +29,12 @@ install-ts:
 
 test-ts:
 	cd Typescript && npm test
+
+# Drives the real @azure/app-configuration-provider against a reserved .invalid endpoint to check
+# the one thing a mocked load() cannot: that clientOptions is still honoured. No Azure, no
+# credentials, no egress — but the provider pads a startup failure to five seconds, so it is slow.
+test-integration-ts:
+	cd Typescript && npm run test:integration
 
 lint-ts:
 	cd Typescript && npm run lint

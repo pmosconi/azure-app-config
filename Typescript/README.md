@@ -167,6 +167,18 @@ arms the retry floor, because it never reached the store.
 
 Clears the memoised result and the retry floor. For tests.
 
+## Tests
+
+```bash
+npm test               # unit; the provider's load() is faked at the module boundary
+npm run test:integration   # the real provider against a reserved .invalid endpoint
+```
+
+The integration run exists for one assertion. `detail` depends on the provider honouring
+`clientOptions`, and with `load()` mocked nothing would notice if it stopped — the unit suite
+would stay green while a refused read was reported as an unreachable store. It needs no Azure,
+no credentials and no egress, but the provider pads a startup failure to five seconds.
+
 ## License
 
 MIT
