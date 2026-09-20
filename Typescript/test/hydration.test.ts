@@ -5,7 +5,7 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 import { load } from '@azure/app-configuration-provider';
 import { hydrate, hydrateWithBackoff, resetHydration } from '../src/index';
-import { KEYS, VALUES, fakeStore, providerAggregate, forbidden, restoreEnv, snapshotEnv } from './helpers';
+import { KEYS, VALUES, fakeStore, providerFailoverError, restoreEnv, snapshotEnv } from './helpers';
 
 vi.mock('@azure/app-configuration-provider', () => ({ load: vi.fn() }));
 vi.mock('@azure/identity', () => ({
@@ -81,6 +81,34 @@ describe('writing the environment', () => {
     expect(result.kept).toEqual(['HTTP_PORT']);
   });
 
+  it('lets a local value stand in for a key the store has not got yet', async () => {
+    // The README promises a .env line can point one variable at a local database "without
+    // reaching into the store". Deciding precedence after the missing-key check broke that: the
+    // load failed on a key the caller had already supplied.
+    process.env.NODE_ENV = 'development';
+    process.env.HTTP_PORT = '3000';
+    loadMock.mockResolvedValue(
+      fakeStore({
+        'shared:mongoUrl': VALUES['shared:mongoUrl']!,
+        'shared:serviceBus': VALUES['shared:serviceBus']!,
+      }) as never
+    );
+
+    const result = await hydrate({ keys: KEYS });
+
+    expect(result.kept).toEqual(['HTTP_PORT']);
+    expect(process.env.HTTP_PORT).toBe('3000');
+  });
+
+  it('still fails on a missing key the local environment does not supply', async () => {
+    process.env.NODE_ENV = 'development';
+    loadMock.mockResolvedValue(
+      fakeStore({ 'shared:mongoUrl': VALUES['shared:mongoUrl']! }) as never
+    );
+
+    await expect(hydrate({ keys: KEYS, retryFloorMs: 0 })).rejects.toThrow(/myapp:httpPort/);
+  });
+
   it('treats an empty local value as absent', async () => {
     process.env.NODE_ENV = 'development';
     process.env.HTTP_PORT = '';
@@ -109,6 +137,28 @@ describe('missing keys', () => {
     loadMock.mockResolvedValue(fakeStore({ ...VALUES, 'myapp:httpPort': '' }) as never);
 
     await expect(hydrate({ keys: KEYS, retryFloorMs: 0 })).rejects.toThrow(/myapp:httpPort/);
+  });
+
+  it('refuses a JSON key-value rather than writing "[object Object]"', async () => {
+    // A key-value with a JSON content type comes back from the provider parsed, so get<string>()
+    // is a type assertion the provider does not honour. An environment variable is a string or
+    // it is a mistake.
+    loadMock.mockResolvedValue(
+      fakeStore({ ...VALUES, 'myapp:httpPort': { port: 8080 } }) as never
+    );
+
+    await expect(hydrate({ keys: KEYS, retryFloorMs: 0 })).rejects.toThrow(
+      /myapp:httpPort .*a JSON object rather than a string/
+    );
+    expect(process.env.HTTP_PORT).toBeUndefined();
+  });
+
+  it('refuses a number as firmly as an object', async () => {
+    loadMock.mockResolvedValue(fakeStore({ ...VALUES, 'myapp:httpPort': 8080 }) as never);
+
+    await expect(hydrate({ keys: KEYS, retryFloorMs: 0 })).rejects.toThrow(
+      /a number rather than a string/
+    );
   });
 
   it('writes the keys it did find before it throws', async () => {
@@ -195,9 +245,9 @@ describe('how the store is addressed', () => {
 describe('hydrateWithBackoff', () => {
   it('widens the delay and reports each failure', async () => {
     loadMock
-      .mockRejectedValueOnce(providerAggregate(forbidden()))
-      .mockRejectedValueOnce(providerAggregate(forbidden()))
-      .mockRejectedValueOnce(providerAggregate(forbidden()))
+      .mockRejectedValueOnce(providerFailoverError())
+      .mockRejectedValueOnce(providerFailoverError())
+      .mockRejectedValueOnce(providerFailoverError())
       .mockResolvedValue(fakeStore() as never);
     const delays: number[] = [];
 
@@ -211,7 +261,7 @@ describe('hydrateWithBackoff', () => {
   });
 
   it('is the only place that retries — a bare hydrate stays a single attempt', async () => {
-    loadMock.mockRejectedValue(providerAggregate(forbidden()));
+    loadMock.mockRejectedValue(providerFailoverError());
 
     await expect(hydrate({ keys: KEYS, retryFloorMs: 0 })).rejects.toThrow();
 

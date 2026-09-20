@@ -49,11 +49,14 @@ Everything else — endpoint, label, credential — comes from the environment b
 it that four things went wrong in, each of which was invisible from reading the provider's
 documentation and cost a production incident or a near miss to find.
 
-**A failed load does not say why.** A revoked role assignment and an unreachable store are
-indistinguishable in the provider's output: you get `All fallback clients failed to get
-configuration settings` three times, then `The load operation timed out`. No 403, anywhere.
-`ConfigLoadError` unwraps the aggregate and reports the underlying cause, so the next person to
-hit this does not need a runbook open to attribute it.
+**A failed load does not say why — and unwrapping the error cannot tell you.** A revoked role
+assignment and an unreachable store are indistinguishable in the provider's output: you get
+`All fallback clients failed to get configuration settings`, then `The load operation failed`.
+No 403, anywhere. The reason is not buried, it is *gone*: the provider catches the underlying
+`RestError`, moves to the next client, and on running out throws a sentence it constructs fresh,
+with no `cause` attached. So this package hands the provider a pipeline policy through
+`clientOptions` and reads the status off the wire as it goes past. `ConfigLoadError.detail` is
+what the store actually answered, at the cost of no extra request.
 
 **The default startup timeout is longer than the platform's patience.** The provider retries
 internally for about 100 seconds before it reports failure. App Service gives a container less
@@ -134,6 +137,10 @@ the branch — and it is exactly why the label is its own variable and not deriv
 Those are two different questions about the same run. A staging container reading
 `NODE_ENV=production` from its own image would otherwise load production databases.
 
+Precedence is decided before a key is called missing, so under `NODE_ENV=development` a `.env`
+line also stands in for a key that is not in the store yet — which is the point of reaching for it
+in the first place.
+
 Set `localOverridesWin` explicitly if your application does not use `NODE_ENV` this way.
 
 ## Why an explicit key map and not a prefix filter
@@ -143,6 +150,11 @@ generally not the same string. And more seriously: **every Key Vault reference t
 loads, it also resolves.** A selector like `shared:*` therefore tries to resolve secrets your
 application holds no grant on, and turns another application's credential into your startup
 failure. One selector per key means nothing outside the map is ever fetched.
+
+The values must be strings. A key-value with a JSON content type comes back from the provider
+parsed, and the provider's `get<string>()` does not prevent that — so an object would otherwise
+land in the environment as the string `[object Object]`, reported as applied. Those are refused
+by name alongside the absent ones.
 
 ## API
 
@@ -165,18 +177,32 @@ store.
 | `logger` | `console` | |
 
 Returns `{ label, applied, kept }` — which variables were written and which were left alone.
-Throws `ConfigLoadError` if the store cannot be read, and a plain `Error` naming every key that
-was absent or empty at that label.
+Throws `ConfigLoadError` if the store cannot be read, `ConfigInputError` for a call no retry can
+fix, and a plain `Error` naming every key that was absent, empty, or not a string at that label.
+
+A success is memoised against the `keys`/`label` pair it was made with, not globally: one worker
+process hosting several functions must not hand the second one the first one's result.
 
 ### `hydrateWithBackoff(options, backoff?): Promise<HydrationResult>`
 
 Calls `hydrate` until it succeeds. `backoff` is `{ initialMs = 5_000, maxMs = 600_000, onError }`.
-Never returns a rejection — it retries forever, by design. **Long-lived processes only.**
+It retries a failure the store could recover from for as long as that takes, and rejects
+immediately with `ConfigInputError` on one it cannot — a wildcard key, a missing label, a request
+the store rejects as malformed. A container looping forever on a typo looks exactly like one
+waiting out an outage, and only one of those is worth waiting for.
+**Long-lived processes only.**
 
 ### `ConfigLoadError`
 
-`message` names what failed; `cause` is the provider's error; `detail` is the unwrapped
-underlying reason, which is the part the provider hides.
+`message` names the store and label that failed and carries the reason; `cause` is the provider's
+error, unmodified; `detail` is what the store actually answered; `statusCode` is the HTTP status
+where one was seen; `observations` is every distinct failure seen on the wire during the attempt.
+
+### `ConfigInputError`
+
+A call no retry can fix: a wildcard key, an empty key map, no label, no endpoint, or a request the
+store rejected as malformed. `hydrateWithBackoff` re-throws it rather than looping, and it never
+arms the retry floor, because it never reached the store.
 
 ### `resetHydration()`
 

@@ -8,7 +8,7 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 import { load } from '@azure/app-configuration-provider';
 import { hydrate, hydrateWithBackoff, resetHydration } from '../src/index';
-import { KEYS, fakeStore, providerAggregate, forbidden, restoreEnv, snapshotEnv } from './helpers';
+import { KEYS, fakeStore, providerFailoverError, restoreEnv, snapshotEnv } from './helpers';
 
 vi.mock('@azure/app-configuration-provider', () => ({ load: vi.fn() }));
 vi.mock('@azure/identity', () => ({
@@ -43,7 +43,7 @@ describe('one attempt per call', () => {
   });
 
   it('calls the provider exactly once on failure, and rejects rather than retrying', async () => {
-    loadMock.mockRejectedValue(providerAggregate(forbidden()));
+    loadMock.mockRejectedValue(providerFailoverError());
 
     await expect(hydrate({ keys: KEYS })).rejects.toThrow();
 
@@ -69,8 +69,8 @@ describe('one attempt per call', () => {
 
   it('puts the loop in hydrateWithBackoff, where a long-lived process opts into it', async () => {
     loadMock
-      .mockRejectedValueOnce(providerAggregate(forbidden()))
-      .mockRejectedValueOnce(providerAggregate(forbidden()))
+      .mockRejectedValueOnce(providerFailoverError())
+      .mockRejectedValueOnce(providerFailoverError())
       .mockResolvedValue(fakeStore() as never);
 
     const result = await hydrateWithBackoff(

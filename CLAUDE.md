@@ -42,10 +42,33 @@ without a real reason recorded in the commit message.
    every invocation, which on the Free SKU (1,000 req/day, then 429 to every reader until
    midnight UTC) spends the quota in minutes and starves every other consumer of the store.
    Hence `retryFloorMs`: inside the floor, re-throw the previous error without touching the store.
-3. **Report the underlying cause.** The provider hides it — a refused read surfaces as
-   `All fallback clients failed to get configuration settings` ×3 and then `The load operation
-   timed out`, with no 403 anywhere. A revoked grant and an unreachable store are
-   indistinguishable. `ConfigLoadError.detail` must unwrap the aggregate.
+3. **Report the underlying cause.** The provider *discards* it — a refused read surfaces as
+   `All fallback clients failed to get configuration settings` wrapped in `The load operation
+   failed`, with no 403 anywhere. A revoked grant and an unreachable store are indistinguishable.
+   `ConfigLoadError.detail` must report that cause.
+
+   **Correction, 20 September 2026 — unwrapping does not achieve this.** The provider discards
+   the error rather than wrapping it: `#executeWithFailoverPolicy` catches a failoverable error,
+   `continue`s to the next client and drops it, then throws a bare `All fallback clients failed…`
+   with no `cause` and no `errors`. `isFailoverableError` covers 401/403/408/429/5xx and
+   ENOTFOUND/ENOENT/ECONNREFUSED/ECONNRESET/ETIMEDOUT — every failure that matters. So walking
+   `errors[]`/`cause` finds nothing; only a *non*-failoverable `RestError` (404, a bad filter)
+   survives intact, which is why it looked like it worked.
+
+   **Resolved, 20 September 2026 — by a pipeline policy, not a second request.** The note above
+   proposed asking again with one direct `getConfigurationSetting`. That works, but it spends
+   another request against the budget invariant 2 exists to protect, and it reports a *different*
+   request's outcome. `clientOptions` is a documented provider option that it merges into every
+   client it builds (`getClientOptions`, `Object.assign`), so `src/diagnostics.ts` passes a policy
+   at `perRetry` — below the SDK's retry policy — which sees the raw response before the generated
+   client turns it into an error, and the transport error when there is no response. The status is
+   observed on the way past, at no extra request. The provider's own chain still wins wherever it
+   does preserve a cause. Where nothing was seen at all, `detail` says so, which distinguishes an
+   unreachable store from a refused read rather than merely repeating the provider.
+
+   The fixtures in `test/helpers.ts` are now the provider's real shapes, with source line numbers.
+   Restoring the old fabricated `errors: [...]` aggregate fails four tests.
+
 4. **Explicit key map, one selector per key.** Never a prefix or wildcard selector. Every Key
    Vault reference the provider loads it also resolves, so a wildcard attempts to resolve secrets
    the caller holds no grant on and turns another application's credential into this
@@ -72,6 +95,9 @@ without a real reason recorded in the commit message.
 - Tests are **vitest**, no live Azure — fake the provider's `load()` at the module boundary.
   Every invariant above gets a test that fails if it is relaxed: single attempt, failure not
   memoised, floor enforced, cause surfaced, no wildcard selector reaches the provider.
+- **Error fixtures must match the provider's real shape**, which `test/helpers.ts` records with
+  source line numbers. A fixture easier to unwrap than reality certifies the bug it was written
+  to catch.
 - Public API stays small and additive. Pre-1.0 it can change; after 1.0 a change to any of the
   four invariants is a major.
 - Keep the two implementations behaviourally identical. Same option names in snake_case, same
@@ -85,6 +111,11 @@ without a real reason recorded in the commit message.
 - [ ] Second consumer: a container web app, converted from its inlined copy
 - [ ] `1.0.0` published to npm — only after both consumers run on it
 - [ ] Python half, then its own second consumer
+
+Open, deferred to `1.0.0`: the memoised state is module-scope, so a consumer graph reaching both
+the ESM and the CJS build gets two of it and `resetHydration()` clears one. A `globalThis` symbol
+registry fixes it; whether two *versions* of the package in one graph should share state needs
+deciding first.
 
 Two copies of the hydrator exist in consumer repositories today. They are the specification;
 read them before writing this one, and delete them as each consumer converts.

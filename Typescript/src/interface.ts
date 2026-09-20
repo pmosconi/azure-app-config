@@ -76,18 +76,38 @@ export interface BackoffOptions {
   onError?: (error: unknown, nextDelayMs: number) => void;
 }
 
+/** One failure seen on the wire, captured by the diagnostics policy. */
+export interface FailureObservation {
+  /** HTTP status, when the failure was a response rather than a transport error. */
+  status?: number;
+  /** Node or SDK error code — `ENOTFOUND`, `ECONNREFUSED`, `AbortError`. */
+  code?: string;
+  message: string;
+}
+
 /**
  * All the state the module holds, in one object so that `resetHydration()` clears every part of
- * it — the memoised success and the retry floor's bookkeeping alike. A floor whose timestamp
- * survived a reset would make the first attempt of the next test re-throw the previous test's
- * error.
+ * it — the memoised successes and the retry floor's bookkeeping alike. A floor whose timestamp
+ * survived a reset would make the first attempt after it re-throw a discarded error.
  *
  * Internal: not exported from the package.
  */
 export interface HydrationState {
-  /** The in-flight or successful attempt. Never a rejected promise. */
-  inFlight?: Promise<HydrationResult>;
-  /** When the last attempt failed, and with what. The retry floor is measured from here. */
+  /**
+   * Memoised attempts, keyed on the key map and label they were made with.
+   *
+   * Keyed, rather than a single promise, because one process legitimately holds more than one
+   * call site: a Functions worker hosts every function in the app, and a handler that declares
+   * its own subset of keys must not be handed another handler's result and told it succeeded.
+   */
+  attempts: Map<string, Promise<HydrationResult>>;
+  /**
+   * When the last attempt failed, and with what.
+   *
+   * Deliberately *not* per key map. The memo is about correctness and belongs to a call site;
+   * the floor is about the store's request quota, which every call site spends from together.
+   * Two key maps failing against a dead store must cost one request per floor, not two.
+   */
   failedAt?: number;
   lastError?: unknown;
 }
