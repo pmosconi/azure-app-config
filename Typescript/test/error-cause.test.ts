@@ -114,7 +114,10 @@ describe('the failure the provider discards', () => {
     expect(error.observations[0]!.status).toBe(500);
   });
 
-  it('says so when nothing came back at all', async () => {
+  it('blames the credential, not the store, when nothing reached the transport', async () => {
+    // A store that refuses or cannot be reached is *observed* — a refused connection and a failed
+    // name lookup both throw under the policy. So a timeout with nothing observed is evidence
+    // about this side of the wire, and saying "the store was unreachable" would be a guess.
     loadMock.mockImplementation(failingLoadWithNoRequest(providerTimeoutError()) as never);
 
     const error = (await hydrate({ keys: KEYS, retryFloorMs: 0 }).catch(
@@ -122,8 +125,27 @@ describe('the failure the provider discards', () => {
     )) as ConfigLoadError;
 
     expect(error.statusCode).toBeUndefined();
-    expect(error.detail).toContain('unreachable or slower than the startup timeout');
-    expect(error.detail).toContain('rather than refusing the read');
+    expect(error.detail).toContain('no request reached the transport');
+    expect(error.detail).toContain('rather than the store');
+    expect(error.detail).not.toContain('unreachable');
+  });
+
+  it('reports its own diagnostics as broken rather than guessing about the store', async () => {
+    // "All fallback clients failed" with nothing observed is a contradiction, not a fact: the
+    // provider throws it only after each client threw a REST error, which the policy records.
+    // Zero observations therefore means the policy did not run — a provider upgrade that stopped
+    // honouring clientOptions, say — and the honest report is that the cause is unreported.
+    loadMock.mockImplementation(failingLoadWithNoRequest(providerFailoverError()) as never);
+
+    const error = (await hydrate({ keys: KEYS, retryFloorMs: 0 }).catch(
+      (e: unknown) => e
+    )) as ConfigLoadError;
+
+    expect(error.detail).toContain('the cause is unreported');
+    expect(error.detail).toContain('clientOptions');
+    // The sentence that would have been confidently, specifically wrong for a 403.
+    expect(error.detail).not.toContain('unreachable');
+    expect(error.detail).not.toContain('refusing the read');
   });
 });
 

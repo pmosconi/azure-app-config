@@ -50,8 +50,10 @@ describe('the real provider', () => {
     // The contract, in one assertion: clientOptions was honoured and the policy ran.
     expect(failure.observations.length).toBeGreaterThan(0);
 
-    // And the fallback branch was not taken — this is the sentence that would be wrong.
-    expect(failure.detail).not.toContain('no response was observed');
+    // And no zero-observation branch was taken — including the one that reports the diagnostics
+    // themselves as broken, which is exactly what a lost clientOptions contract looks like.
+    expect(failure.detail).not.toContain('the cause is unreported');
+    expect(failure.detail).not.toContain('no request');
 
     // What the provider handed us, for contrast: nothing usable, bottoming out with no cause.
     expect((failure.cause as Error).message).toBe('The load operation failed.');

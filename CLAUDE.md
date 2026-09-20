@@ -64,8 +64,17 @@ without a real reason recorded in the commit message.
    at `perRetry` — below the SDK's retry policy — which sees the raw response before the generated
    client turns it into an error, and the transport error when there is no response. The status is
    observed on the way past, at no extra request. The provider's own chain still wins wherever it
-   does preserve a cause. Where nothing was seen at all, `detail` says so, which distinguishes an
-   unreachable store from a refused read rather than merely repeating the provider.
+   does preserve a cause.
+
+   **Zero observations is not a fact about the store, and must not be reported as one.** An
+   unreachable store and a refused one are both *observed* — a failed lookup and a refused
+   connection throw under the policy. So `explain()` splits on what the provider said:
+   `All fallback clients failed` with nothing observed is a contradiction, since the provider
+   throws that only after each client threw a REST error the policy would have recorded — it means
+   the policy did not run, and `detail` says the cause is unreported and names `clientOptions`.
+   `The load operation timed out` with nothing observed means nothing reached the transport, so it
+   points at the credential, not the store. Guessing "the store was unreachable" in either case
+   would be confidently, specifically wrong in the one sentence 13 September needed right.
 
    The fixtures in `test/helpers.ts` are now the provider's real shapes, with source line numbers.
    Restoring the old fabricated `errors: [...]` aggregate fails four tests.

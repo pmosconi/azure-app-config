@@ -72,10 +72,14 @@ const DEFAULT_MAX_BACKOFF_MS = 600_000;
  * The sentences the provider produces in place of a cause. Recognising them is what lets the
  * diagnostics observations take over: anything else in the chain is a real error and wins.
  */
+const ALL_FALLBACK_CLIENTS_FAILED = 'All fallback clients failed to get configuration settings.';
+const LOAD_OPERATION_TIMED_OUT = 'The load operation timed out.';
+const LOAD_OPERATION_FAILED = 'The load operation failed.';
+
 const OPAQUE_PROVIDER_MESSAGES = [
-  'All fallback clients failed to get configuration settings.',
-  'The load operation timed out.',
-  'The load operation failed.',
+  ALL_FALLBACK_CLIENTS_FAILED,
+  LOAD_OPERATION_TIMED_OUT,
+  LOAD_OPERATION_FAILED,
 ];
 
 function freshState(): HydrationState {
@@ -354,12 +358,36 @@ function explain(
     };
   }
 
-  // Nothing came back at all — no response, no transport error. The store was unreachable or too
-  // slow, which is a different fact from the store refusing the read, and worth saying so.
-  return {
-    detail: `${unwrapped.detail} (no response was observed, so the store was unreachable or slower than the startup timeout, rather than refusing the read)`,
-    statusCode: undefined,
-  };
+  // Nothing was observed. What can honestly be concluded from that depends entirely on which
+  // sentence the provider produced, and one of the two is a contradiction rather than a fact.
+
+  if (unwrapped.messages.includes(ALL_FALLBACK_CLIENTS_FAILED)) {
+    // This combination is impossible while the diagnostics policy is running. The provider throws
+    // this only after iterating clients that each threw a *failoverable* error, and
+    // `isFailoverableError` requires `isRestError` — a >= 400 response, or a transport failure
+    // carrying a code. Both are things the policy records. So zero observations here does not
+    // mean the store was quiet; it means the policy never ran, and the cause is unreported.
+    //
+    // Saying anything about the store at this point would be a guess presented as a finding,
+    // which is the failure mode this whole file exists to remove.
+    return {
+      detail: `${unwrapped.detail} (the cause is unreported: no HTTP failure was observed, which cannot happen while the diagnostics policy is running, so the provider is no longer honouring clientOptions and the real reason was discarded)`,
+      statusCode: undefined,
+    };
+  }
+
+  if (unwrapped.messages.includes(LOAD_OPERATION_TIMED_OUT)) {
+    // A store that is unreachable or refusing *is* observed — a refused connection and a failed
+    // name lookup both throw in the transport, under the policy. So a timeout with nothing
+    // observed means nothing reached the transport: the credential never arrived, or the abort
+    // fired before the first request went out. That is not evidence about the store.
+    return {
+      detail: `${unwrapped.detail} (no request reached the transport before the startup timeout, so the credential or the first send is the suspect rather than the store)`,
+      statusCode: undefined,
+    };
+  }
+
+  return { detail: `${unwrapped.detail} (no request was observed)`, statusCode: undefined };
 }
 
 /**
@@ -369,7 +397,12 @@ function explain(
  * not resolve. `opaque` says that it did not: that every leaf is one of the sentences the
  * provider manufactures, and the real reason has to come from somewhere else.
  */
-function unwrap(error: unknown): { detail: string; statusCode: number | undefined; opaque: boolean } {
+function unwrap(error: unknown): {
+  detail: string;
+  statusCode: number | undefined;
+  opaque: boolean;
+  messages: string[];
+} {
   const leaves: unknown[] = [];
   const seen = new Set<unknown>();
 
@@ -402,7 +435,16 @@ function unwrap(error: unknown): { detail: string; statusCode: number | undefine
     statusCode === undefined &&
     leaves.every(leaf => leaf instanceof Error && OPAQUE_PROVIDER_MESSAGES.includes(leaf.message));
 
-  return { detail: messages.join('; ') || 'no underlying error reported', statusCode, opaque };
+  const rawMessages = leaves
+    .filter((leaf): leaf is Error => leaf instanceof Error)
+    .map(leaf => leaf.message);
+
+  return {
+    detail: messages.join('; ') || 'no underlying error reported',
+    statusCode,
+    opaque,
+    messages: rawMessages,
+  };
 }
 
 /** The provider's own classification: `ArgumentError`, `TypeError`, `RangeError` are input errors. */
