@@ -68,13 +68,24 @@ without a real reason recorded in the commit message.
 
    **Zero observations is not a fact about the store, and must not be reported as one.** An
    unreachable store and a refused one are both *observed* — a failed lookup and a refused
-   connection throw under the policy. So `explain()` splits on what the provider said:
-   `All fallback clients failed` with nothing observed is a contradiction, since the provider
-   throws that only after each client threw a REST error the policy would have recorded — it means
-   the policy did not run, and `detail` says the cause is unreported and names `clientOptions`.
-   `The load operation timed out` with nothing observed means nothing reached the transport, so it
-   points at the credential, not the store. Guessing "the store was unreachable" in either case
-   would be confidently, specifically wrong in the one sentence 13 September needed right.
+   connection each throw in the transport, under the policy. So silence is only ever evidence
+   about this side of the wire.
+
+   **Attribute it from in-process evidence, never from the provider's wording.** A hung credential
+   and a provider that has stopped honouring `clientOptions` produce a byte-identical chain —
+   `The load operation failed.` wrapping `The load operation timed out.`, zero observations, both
+   verified against the real provider. No string can separate them. What separates them is whether
+   `getToken` resolved, so `src/diagnostics.ts` wraps the store credential the same way it wraps
+   the pipeline, and `attributeSilence()` reads that: token arrived and nothing observed means the
+   policy did not run (`clientOptions` is the suspect); token never arrived means the credential
+   is; no token in play means the cause is unreported, said plainly rather than guessed at.
+
+   An earlier attempt keyed this on the `All fallback clients failed` message. That branch was
+   **unreachable** — the message is a plain `Error`, so `#initializeWithRetryPolicy` finds it
+   neither an input nor a REST error and backs off on it until the abort, by which point the
+   timeout has won the race; it only ever reaches `console.warn`. The message stays in the opaque
+   set, but nothing is keyed on it: a guard that reads the provider's wording fails open when the
+   wording changes, and this one failed open on day one.
 
    The fixtures in `test/helpers.ts` are now the provider's real shapes, with source line numbers.
    Restoring the old fabricated `errors: [...]` aggregate fails four tests.

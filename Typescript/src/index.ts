@@ -1,8 +1,15 @@
 import { load, type AzureAppConfiguration } from '@azure/app-configuration-provider';
 import { DefaultAzureCredential, type TokenCredential } from '@azure/identity';
-import { createDiagnostics, describeObservations, type Diagnostics } from './diagnostics';
+import {
+  createDiagnostics,
+  describeObservations,
+  watchCredential,
+  type CredentialWatch,
+  type Diagnostics,
+} from './diagnostics';
 import type {
   BackoffOptions,
+  CredentialEvidence,
   FailureObservation,
   HydrateOptions,
   HydrationResult,
@@ -52,8 +59,13 @@ export class ConfigLoadError extends Error {
   /** Every distinct failure seen on the wire during the attempt. Empty if none got that far. */
   readonly observations: FailureObservation[];
 
-  constructor(message: string, cause: unknown, observations: FailureObservation[] = []) {
-    const { detail, statusCode } = explain(cause, observations);
+  constructor(
+    message: string,
+    cause: unknown,
+    observations: FailureObservation[] = [],
+    credential?: CredentialEvidence
+  ) {
+    const { detail, statusCode } = explain(cause, observations, credential);
     super(`${message}: ${detail}`);
     this.name = 'ConfigLoadError';
     this.cause = cause;
@@ -72,14 +84,14 @@ const DEFAULT_MAX_BACKOFF_MS = 600_000;
  * The sentences the provider produces in place of a cause. Recognising them is what lets the
  * diagnostics observations take over: anything else in the chain is a real error and wins.
  */
-const ALL_FALLBACK_CLIENTS_FAILED = 'All fallback clients failed to get configuration settings.';
-const LOAD_OPERATION_TIMED_OUT = 'The load operation timed out.';
-const LOAD_OPERATION_FAILED = 'The load operation failed.';
-
 const OPAQUE_PROVIDER_MESSAGES = [
-  ALL_FALLBACK_CLIENTS_FAILED,
-  LOAD_OPERATION_TIMED_OUT,
-  LOAD_OPERATION_FAILED,
+  // Kept although it never reaches a caller from the startup path today — it is a plain Error, so
+  // the provider's retry loop finds it neither an input nor a REST error and backs off on it until
+  // the abort, by which point the timeout has won. Nothing is keyed on it: a guard that reads the
+  // provider's wording is a guard that fails open when the wording changes. See explain().
+  'All fallback clients failed to get configuration settings.',
+  'The load operation timed out.',
+  'The load operation failed.',
 ];
 
 function freshState(): HydrationState {
@@ -302,6 +314,10 @@ async function loadStore(
   const endpoint = options.endpoint ?? process.env.APP_CONFIG_ENDPOINT;
 
   const diagnostics: Diagnostics = createDiagnostics();
+  // Only the store credential is wrapped. The Key Vault client gets the caller's own object
+  // unchanged, because a vault failure is reported by the provider with its cause intact and
+  // needs no help from us.
+  let watch: CredentialWatch | undefined;
   const loadOptions = {
     selectors: keys.map(key => ({ keyFilter: key, labelFilter: label })),
     keyVaultOptions: { credential: getCredential() },
@@ -321,16 +337,17 @@ async function loadStore(
     if (connectionString) {
       return await load(connectionString, loadOptions);
     }
-    return await load(endpoint as string, getCredential(), loadOptions);
+    watch = watchCredential(getCredential());
+    return await load(endpoint as string, watch.credential, loadOptions);
   } catch (error) {
     const where = connectionString ? 'the configured connection string' : endpoint;
     const message = `Could not read App Configuration at ${where}, label ${label}`;
     const observations = diagnostics.observations();
     if (hasInputError(error)) {
-      const { detail } = explain(error, observations);
+      const { detail } = explain(error, observations, watch?.evidence());
       throw new ConfigInputError(`${message}: ${detail}`, error);
     }
-    throw new ConfigLoadError(message, error, observations);
+    throw new ConfigLoadError(message, error, observations, watch?.evidence());
   }
 }
 
@@ -344,7 +361,8 @@ async function loadStore(
  */
 function explain(
   cause: unknown,
-  observations: FailureObservation[]
+  observations: FailureObservation[],
+  credential: CredentialEvidence | undefined
 ): { detail: string; statusCode: number | undefined } {
   const unwrapped = unwrap(cause);
   if (!unwrapped.opaque) {
@@ -358,36 +376,32 @@ function explain(
     };
   }
 
-  // Nothing was observed. What can honestly be concluded from that depends entirely on which
-  // sentence the provider produced, and one of the two is a contradiction rather than a fact.
+  return { detail: `${unwrapped.detail} ${attributeSilence(credential)}`, statusCode: undefined };
+}
 
-  if (unwrapped.messages.includes(ALL_FALLBACK_CLIENTS_FAILED)) {
-    // This combination is impossible while the diagnostics policy is running. The provider throws
-    // this only after iterating clients that each threw a *failoverable* error, and
-    // `isFailoverableError` requires `isRestError` — a >= 400 response, or a transport failure
-    // carrying a code. Both are things the policy records. So zero observations here does not
-    // mean the store was quiet; it means the policy never ran, and the cause is unreported.
-    //
-    // Saying anything about the store at this point would be a guess presented as a finding,
-    // which is the failure mode this whole file exists to remove.
-    return {
-      detail: `${unwrapped.detail} (the cause is unreported: no HTTP failure was observed, which cannot happen while the diagnostics policy is running, so the provider is no longer honouring clientOptions and the real reason was discarded)`,
-      statusCode: undefined,
-    };
+/**
+ * Nothing was observed. Say what that is evidence of — and, where it is evidence of nothing, say
+ * that instead of guessing.
+ *
+ * An unreachable store and a refused one are both *observed*: a failed name lookup and a refused
+ * connection each throw in the transport, underneath the policy. So silence is never evidence
+ * about the store, and the earlier wording — "the store was unreachable or slower than the
+ * startup timeout" — was a guess presented as a finding, which is the failure this package exists
+ * to remove. What silence does distinguish is whether the credential answered.
+ */
+function attributeSilence(credential: CredentialEvidence | undefined): string {
+  if (credential === undefined) {
+    return '(no request was observed, and no token was in play on this path, so the cause is unreported)';
   }
-
-  if (unwrapped.messages.includes(LOAD_OPERATION_TIMED_OUT)) {
-    // A store that is unreachable or refusing *is* observed — a refused connection and a failed
-    // name lookup both throw in the transport, under the policy. So a timeout with nothing
-    // observed means nothing reached the transport: the credential never arrived, or the abort
-    // fired before the first request went out. That is not evidence about the store.
-    return {
-      detail: `${unwrapped.detail} (no request reached the transport before the startup timeout, so the credential or the first send is the suspect rather than the store)`,
-      statusCode: undefined,
-    };
+  if (!credential.requested) {
+    return '(no request was observed and no token was ever requested, so the cause is unreported)';
   }
-
-  return { detail: `${unwrapped.detail} (no request was observed)`, statusCode: undefined };
+  if (!credential.resolved) {
+    return '(the credential was asked for a token and never answered, so the credential is the suspect rather than the store)';
+  }
+  // The token arrived, so the provider got as far as building a request — and no request was
+  // seen. That cannot happen while the policy is installed, so the policy is not installed.
+  return '(the credential answered but no request was observed, which cannot happen while the diagnostics policy is running — so the provider is no longer honouring clientOptions, and the real cause was discarded)';
 }
 
 /**
@@ -397,12 +411,7 @@ function explain(
  * not resolve. `opaque` says that it did not: that every leaf is one of the sentences the
  * provider manufactures, and the real reason has to come from somewhere else.
  */
-function unwrap(error: unknown): {
-  detail: string;
-  statusCode: number | undefined;
-  opaque: boolean;
-  messages: string[];
-} {
+function unwrap(error: unknown): { detail: string; statusCode: number | undefined; opaque: boolean } {
   const leaves: unknown[] = [];
   const seen = new Set<unknown>();
 
@@ -435,16 +444,7 @@ function unwrap(error: unknown): {
     statusCode === undefined &&
     leaves.every(leaf => leaf instanceof Error && OPAQUE_PROVIDER_MESSAGES.includes(leaf.message));
 
-  const rawMessages = leaves
-    .filter((leaf): leaf is Error => leaf instanceof Error)
-    .map(leaf => leaf.message);
-
-  return {
-    detail: messages.join('; ') || 'no underlying error reported',
-    statusCode,
-    opaque,
-    messages: rawMessages,
-  };
+  return { detail: messages.join('; ') || 'no underlying error reported', statusCode, opaque };
 }
 
 /** The provider's own classification: `ArgumentError`, `TypeError`, `RangeError` are input errors. */

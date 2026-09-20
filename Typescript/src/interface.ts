@@ -86,6 +86,18 @@ export interface FailureObservation {
 }
 
 /**
+ * Whether a token was ever asked for during an attempt, and whether it ever came back.
+ *
+ * The signal has to be in-process. The provider produces an identical error chain whether the
+ * credential hung or the diagnostics policy vanished, so no string can separate them — but the
+ * two differ in whether `getToken` resolved, which is observable here.
+ */
+export interface CredentialEvidence {
+  requested: boolean;
+  resolved: boolean;
+}
+
+/**
  * All the state the module holds, in one object so that `resetHydration()` clears every part of
  * it — the memoised successes and the retry floor's bookkeeping alike. A floor whose timestamp
  * survived a reset would make the first attempt after it re-throw a discarded error.

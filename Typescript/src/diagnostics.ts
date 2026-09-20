@@ -1,5 +1,6 @@
 import type { PipelinePolicy, PipelineRequest, PipelineResponse, SendRequest } from '@azure/core-rest-pipeline';
-import type { FailureObservation } from './interface';
+import type { TokenCredential } from '@azure/identity';
+import type { CredentialEvidence, FailureObservation } from './interface';
 
 /**
  * Why this file exists.
@@ -141,4 +142,43 @@ function fromTransportError(error: unknown): FailureObservation {
 
 function truncate(text: string): string {
   return text.length > MAX_BODY_CHARACTERS ? `${text.slice(0, MAX_BODY_CHARACTERS)}…` : text;
+}
+
+
+/**
+ * The other half of observing on the way past.
+ *
+ * When a load fails having made no observable request, the provider's chain is the same whether
+ * the credential never answered or the policy never ran — it is
+ * `The load operation failed.` wrapping `The load operation timed out.` in both cases. (The
+ * `All fallback clients failed` message never reaches the caller from the startup path at all:
+ * it is a plain `Error`, so `#initializeWithRetryPolicy` finds it neither an input error nor a
+ * REST error, and retries it with backoff until the abort — at which point the timeout has
+ * already won the race. It only ever reaches `console.warn`.)
+ *
+ * So the difference cannot be read out of the error. It can be read here: wrap the credential
+ * and record whether a token was asked for, and whether it arrived. A token that arrived followed
+ * by no observed request is the provider having stopped honouring `clientOptions`; a token that
+ * never arrived is the credential.
+ */
+export interface CredentialWatch {
+  /** Hand this to the provider in place of the real credential. It delegates unchanged. */
+  readonly credential: TokenCredential;
+  evidence(): CredentialEvidence;
+}
+
+export function watchCredential(inner: TokenCredential): CredentialWatch {
+  let requested = false;
+  let resolved = false;
+
+  const credential: TokenCredential = {
+    getToken: async (scopes, options) => {
+      requested = true;
+      const token = await inner.getToken(scopes, options);
+      resolved = true;
+      return token;
+    },
+  };
+
+  return { credential, evidence: () => ({ requested, resolved }) };
 }

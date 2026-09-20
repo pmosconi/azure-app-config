@@ -212,15 +212,34 @@ describe('how the store is addressed', () => {
     expect(loadMock.mock.calls[0]!.length).toBe(3);
   });
 
-  it('uses the caller credential for both the store and the vault references', async () => {
+  it('uses the caller credential for the store, through a watch that delegates to it', async () => {
+    // The store credential is wrapped so that a failed load can say whether a token was ever
+    // asked for and whether it arrived — see src/diagnostics.ts. The wrapper must be transparent.
     const credential = { getToken: vi.fn(async () => null) };
     loadMock.mockResolvedValue(fakeStore() as never);
 
     await hydrate({ keys: KEYS, credential });
 
-    const [, passed, options] = loadMock.mock.calls[0] as unknown[];
-    expect(passed).toBe(credential);
-    expect((options as { keyVaultOptions: { credential: unknown } }).keyVaultOptions.credential).toBe(credential);
+    const [, passed] = loadMock.mock.calls[0] as unknown[];
+    expect(passed).not.toBe(credential);
+
+    const options = { requestOptions: {} };
+    await (passed as { getToken: (s: string, o: unknown) => Promise<unknown> }).getToken(
+      'https://example.invalid/.default',
+      options
+    );
+    expect(credential.getToken).toHaveBeenCalledTimes(1);
+    expect(credential.getToken).toHaveBeenCalledWith('https://example.invalid/.default', options);
+  });
+
+  it('gives the Key Vault client the caller credential untouched', async () => {
+    const credential = { getToken: vi.fn(async () => null) };
+    loadMock.mockResolvedValue(fakeStore() as never);
+
+    await hydrate({ keys: KEYS, credential });
+
+    const options = loadMock.mock.calls[0]!.at(-1) as { keyVaultOptions: { credential: unknown } };
+    expect(options.keyVaultOptions.credential).toBe(credential);
   });
 
   it('defaults the startup timeout to 15 s, not the provider ~100 s', async () => {

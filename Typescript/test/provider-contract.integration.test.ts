@@ -82,4 +82,40 @@ describe('the real provider', () => {
 
     expect(depth).toBeLessThanOrEqual(2);
   });
+
+  it('attributes a hung credential to the credential, on a chain identical to provider drift', async () => {
+    // The point of this test is what it CANNOT read. Against the real provider, a credential that
+    // never answers produces exactly the chain that a provider no longer honouring clientOptions
+    // produces — ["The load operation failed.", "The load operation timed out."] with zero
+    // observations in both cases. No string in the error separates them. The attribution comes
+    // from whether getToken resolved, which is why it is recorded in-process.
+    let requested = false;
+    const hanging: TokenCredential = {
+      getToken: () => {
+        requested = true;
+        return new Promise(() => {});
+      },
+    };
+
+    const error = (await hydrate({
+      keys: { 'shared:mongoUrl': 'MONGO_URL_UNUSED' },
+      label: 'prod',
+      endpoint: 'https://nope.example.invalid',
+      credential: hanging,
+      timeoutMs: 3_000,
+      retryFloorMs: 0,
+      logger: { log: () => {} },
+    }).catch((e: unknown) => e)) as ConfigLoadError;
+
+    expect(requested).toBe(true);
+    expect(error.observations).toHaveLength(0);
+    expect((error.cause as Error).message).toBe('The load operation failed.');
+    expect(((error.cause as Error).cause as Error).message).toBe('The load operation timed out.');
+
+    expect(error.detail).toContain('never answered');
+    expect(error.detail).toContain('rather than the store');
+    // Not the drift conclusion, and not a guess about the store.
+    expect(error.detail).not.toContain('clientOptions');
+    expect(error.detail).not.toContain('unreachable');
+  });
 });

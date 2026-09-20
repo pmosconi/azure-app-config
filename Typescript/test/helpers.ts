@@ -148,3 +148,33 @@ export function failingLoadWithNoRequest(thrown: Error) {
     throw thrown;
   };
 }
+
+/** A credential that answers instantly. */
+export function respondingCredential() {
+  return {
+    getToken: async () => ({ token: 'not-a-real-token', expiresOnTimestamp: Date.now() + 3_600_000 }),
+  };
+}
+
+/** A credential that is asked and never answers — the case a timeout cannot distinguish. */
+export function hangingCredential() {
+  return { getToken: () => new Promise<never>(() => {}) };
+}
+
+/** A `load()` that asks for a token, waits for it, and then fails without making a request. */
+export function failingLoadAfterToken(thrown: Error) {
+  return async (...args: unknown[]): Promise<never> => {
+    const credential = args[1] as { getToken: (s: string) => Promise<unknown> };
+    await credential.getToken('https://example.invalid/.default');
+    throw thrown;
+  };
+}
+
+/** A `load()` that asks for a token that never arrives, then fails on the startup timeout. */
+export function failingLoadWithPendingToken(thrown: Error) {
+  return async (...args: unknown[]): Promise<never> => {
+    const credential = args[1] as { getToken: (s: string) => Promise<unknown> };
+    void credential.getToken('https://example.invalid/.default').catch(() => undefined);
+    throw thrown;
+  };
+}

@@ -20,6 +20,10 @@ import {
   providerNonFailoverableError,
   providerTimeoutError,
   policiesFrom,
+  respondingCredential,
+  hangingCredential,
+  failingLoadAfterToken,
+  failingLoadWithPendingToken,
   restError,
   restoreEnv,
   snapshotEnv,
@@ -114,38 +118,68 @@ describe('the failure the provider discards', () => {
     expect(error.observations[0]!.status).toBe(500);
   });
 
-  it('blames the credential, not the store, when nothing reached the transport', async () => {
-    // A store that refuses or cannot be reached is *observed* — a refused connection and a failed
-    // name lookup both throw under the policy. So a timeout with nothing observed is evidence
-    // about this side of the wire, and saying "the store was unreachable" would be a guess.
+  /*
+   * Silence is never evidence about the store: an unreachable store and a refused one are both
+   * observed, because a failed name lookup and a refused connection each throw in the transport
+   * under the policy. So these cases are attributed from in-process evidence — whether a token
+   * was asked for and whether it came back — and not from the provider's wording, which is
+   * identical across all of them.
+   */
+  it('names the policy, not the credential, when the token arrived and no request was seen', async () => {
+    // This is what provider drift looks like: clientOptions stops being honoured, so the policy
+    // never runs. The provider's chain is the same one a hung credential produces.
+    loadMock.mockImplementation(failingLoadAfterToken(providerTimeoutError()) as never);
+
+    const error = (await hydrate({
+      keys: KEYS,
+      retryFloorMs: 0,
+      credential: respondingCredential(),
+    }).catch((e: unknown) => e)) as ConfigLoadError;
+
+    expect(error.detail).toContain('clientOptions');
+    expect(error.detail).toContain('the real cause was discarded');
+    expect(error.detail).not.toContain('the credential is the suspect');
+    // The sentences that would each have been confidently, specifically wrong.
+    expect(error.detail).not.toContain('unreachable');
+    expect(error.detail).not.toContain('refusing the read');
+  });
+
+  it('names the credential when the token was asked for and never answered', async () => {
+    loadMock.mockImplementation(failingLoadWithPendingToken(providerTimeoutError()) as never);
+
+    const error = (await hydrate({
+      keys: KEYS,
+      retryFloorMs: 0,
+      credential: hangingCredential(),
+    }).catch((e: unknown) => e)) as ConfigLoadError;
+
+    expect(error.detail).toContain('never answered');
+    expect(error.detail).toContain('rather than the store');
+    expect(error.detail).not.toContain('clientOptions');
+  });
+
+  it('names nothing when no token was ever requested', async () => {
     loadMock.mockImplementation(failingLoadWithNoRequest(providerTimeoutError()) as never);
 
     const error = (await hydrate({ keys: KEYS, retryFloorMs: 0 }).catch(
       (e: unknown) => e
     )) as ConfigLoadError;
 
-    expect(error.statusCode).toBeUndefined();
-    expect(error.detail).toContain('no request reached the transport');
-    expect(error.detail).toContain('rather than the store');
+    expect(error.detail).toContain('the cause is unreported');
     expect(error.detail).not.toContain('unreachable');
   });
 
-  it('reports its own diagnostics as broken rather than guessing about the store', async () => {
-    // "All fallback clients failed" with nothing observed is a contradiction, not a fact: the
-    // provider throws it only after each client threw a REST error, which the policy records.
-    // Zero observations therefore means the policy did not run — a provider upgrade that stopped
-    // honouring clientOptions, say — and the honest report is that the cause is unreported.
-    loadMock.mockImplementation(failingLoadWithNoRequest(providerFailoverError()) as never);
+  it('names nothing on the access-key path, where no token is in play', async () => {
+    process.env.APP_CONFIG_CONNECTION_STRING = 'Endpoint=https://example.invalid;Id=x;Secret=c2VjcmV0';
+    loadMock.mockImplementation(failingLoadWithNoRequest(providerTimeoutError()) as never);
 
     const error = (await hydrate({ keys: KEYS, retryFloorMs: 0 }).catch(
       (e: unknown) => e
     )) as ConfigLoadError;
 
+    expect(error.detail).toContain('no token was in play');
     expect(error.detail).toContain('the cause is unreported');
-    expect(error.detail).toContain('clientOptions');
-    // The sentence that would have been confidently, specifically wrong for a 403.
-    expect(error.detail).not.toContain('unreachable');
-    expect(error.detail).not.toContain('refusing the read');
+    expect(error.detail).not.toContain('credential is the suspect');
   });
 });
 
