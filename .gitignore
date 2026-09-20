@@ -1,0 +1,53 @@
+# Compiled code
+dist/
+lib/
+types/
+*.tsbuildinfo
+
+# Packed tarballs
+*.tgz
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+env/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+build/
+develop-eggs/
+downloads/
+eggs/
+.eggs/
+sdist/
+wheels/
+*.egg
+.coverage
+htmlcov/
+
+# Node
+node_modules/
+coverage/
+.nyc_output/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Local environment — never committed, this repository is public
+.env
+.env.*
+!.env.example
+local.settings.json
+
+# Editors and OS
+.DS_Store
+.idea/
+*.swp

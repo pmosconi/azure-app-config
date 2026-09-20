@@ -1,0 +1,58 @@
+{
+  "name": "@actvalue/azure-app-config",
+  "version": "0.1.0",
+  "description": "Hydrate process.env from Azure App Configuration, with the failure handling that platform actually needs",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "build": "rm -rf dist && tsup src/index.ts --dts --sourcemap --format esm,cjs",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "azure",
+    "app-configuration",
+    "configuration",
+    "key-vault",
+    "environment"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist/"
+  ],
+  "author": "ActValue",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "github:pmosconi/azure-app-config"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@types/node": "^24.x",
+    "@typescript-eslint/eslint-plugin": "^8.68.0",
+    "@typescript-eslint/parser": "^8.68.0",
+    "eslint": "^10.9.1",
+    "tsup": "^8.5.1",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.11"
+  },
+  "dependencies": {
+    "@azure/app-configuration-provider": "^2.6.0",
+    "@azure/identity": "^4.13.2"
+  }
+}
