@@ -42,7 +42,17 @@ without a real reason recorded in the commit message.
    the first attempt the only one. Not rate-limiting means every queue trigger re-attempts on
    every invocation, which on the Free SKU (1,000 req/day, then 429 to every reader until
    midnight UTC) spends the quota in minutes and starves every other consumer of the store.
-   Hence `retryFloorMs`: inside the floor, re-throw the previous error without touching the store.
+   Hence `retryFloorMs`: inside the floor, reject with a `ConfigFloorError` (`retryAfterMs`,
+   `cause: lastError`) without touching the store. **What arms the floor is whether the attempt
+   reached the store**, not what kind of error it ended in: a `ConfigInputError` raised after a
+   response came back arms it (`reachedStore: true`), one rejected before that does not. A request
+   that left and never came back is not a response. A floor rejection is not a failure — it never
+   moves `failedAt`, never reaches `onError`, never widens `hydrateWithBackoff`'s delay — or a
+   steady trickle of messages would hold the floor shut forever and the backoff schedule would
+   drift off it. `retryAfterMs` is rounded up and carries a 50 ms margin, because a timer can fire
+   a millisecond early and a retry that lands inside the floor is the dead-letter path again; the
+   floor itself is enforced exactly. `hydrationStatus()` reads this bookkeeping and never makes a
+   request, so a health endpoint pinging during an outage costs nothing.
 3. **Report the underlying cause.** The provider *discards* it — a refused read surfaces as
    `All fallback clients failed to get configuration settings` wrapped in `The load operation
    failed`, with no 403 anywhere. A revoked grant and an unreachable store are indistinguishable.
@@ -90,10 +100,31 @@ without a real reason recorded in the commit message.
    The fixtures in `test/helpers.ts` are now the provider's real shapes, with source line numbers.
    Restoring the old fabricated `errors: [...]` aggregate fails four tests.
 
+   **Correction, 23 September 2026 — a Key Vault reference failure is not preserved either.**
+   Checked against provider 2.6.0 with a local fake store: an unparseable reference, a malformed
+   secret path and an unreachable vault are each wrapped in `KeyVaultReferenceError`, which the
+   retry loop classes as neither input nor REST, so it re-reads the store and retries until the
+   startup timeout. The caller gets `failed ← timed out` after the store answered 200. The earlier
+   fixture (`failed ← KeyVaultReferenceError ← 403`) was a shape 2.6.0 never produces at startup,
+   and on the endpoint path `attributeSilence()` blamed this case on `clientOptions` drift. The
+   diagnostics policy now counts requests by outcome — answered, failed in the transport, still in
+   flight — snapshotted when the startup timeout fires, because the provider holds a rejection
+   until five seconds after it started and a request answered in that gap would change the
+   picture. **`detail` states what was observed and names every cause that leaves open; it never
+   rules out one the evidence cannot.** A request in flight keeps the network path and the store
+   in play; a complete first read (answered ≥ selectors) keeps a Key Vault reference in play,
+   in flight or not, because 2.6.0 re-reads the store every few seconds while it retries one.
+   Only an incomplete read rules Key Vault out, since references resolve after it. `answered > 0`
+   is the evidence for `reachedStore` (invariant 2). On 2.6.0 no store data reaches the provider's
+   post-read input-error path, so `reachedStore` is defensive.
+
 4. **Explicit key map, one selector per key.** Never a prefix or wildcard selector. Every Key
    Vault reference the provider loads it also resolves, so a wildcard attempts to resolve secrets
    the caller holds no grant on and turns another application's credential into this
-   application's startup failure.
+   application's startup failure. A comma is the same selector spelled differently — App
+   Configuration reads `a,b` as both keys — so `validate()` rejects unescaped `*` and `,` in keys
+   (`\*` and `\,` match the literal character, and the lookup unescapes them), and any `*` or `,`
+   in the label, escaped or not, as the provider does, because exactly one label is read.
 
 ## Other decisions that look arbitrary and are not
 
@@ -105,7 +136,8 @@ without a real reason recorded in the commit message.
   propagation is minutes in both directions, so a restored grant is not a restored application.
 - **The label is its own variable, never derived from `NODE_ENV`.** Images bake
   `ENV NODE_ENV=production`, so a staging container would read the production label and hit
-  production databases.
+  production databases. And in a Functions app `NODE_ENV` is an ordinary per-slot setting that
+  often means something else — which is why precedence no longer reads it either (below).
 - **The diagnostics stop at the access-key path, and that is accepted.** With no token there is
   no second in-process signal, so a provider that stopped honouring `clientOptions` and a
   genuinely silent failure are indistinguishable there; `detail` says the cause is unreported
@@ -114,16 +146,56 @@ without a real reason recorded in the commit message.
   path, where the credential watch works. The failure surfaces to someone already reading the
   stack trace, not to a container answering 503 at four in the morning. Do not file this as a
   defect; closing it means a new signal for the one path carrying no production traffic.
-- **Precedence inverts under `NODE_ENV=development` only.** Store wins everywhere else, so a
-  stale app setting cannot beat a migrated value. Safe precisely because no deployed container
-  can take the development branch.
+- **Precedence inverts only when not deployed, detected by `WEBSITE_INSTANCE_ID` alone.**
+  `localOverridesWin` is a dev-only escape hatch: false in every deployed environment, true
+  locally. Default `options.localOverridesWin ?? !process.env.WEBSITE_INSTANCE_ID`, read on every
+  attempt. App Service and Functions inject it on every instance; `func start`, `node` and test
+  runners never set it. `NODE_ENV` plays no part: 0.1.0 keyed on `NODE_ENV === 'development'`, and
+  a Functions slot is free to carry that value, which let leftover settings beat the store on
+  staging without a warning. No Container Apps or Kubernetes signal yet — the only known hosts are
+  App Service and Functions — so every other host must pass `localOverridesWin: false`, and the
+  docs say so. Add a signal only with a consumer on that host.
+- **`ConfigFloorError` extends `Error`, not `ConfigLoadError` or `ConfigInputError`.** A catch on
+  `ConfigLoadError` means "a store attempt just failed" and counts it; a floor rejection attempted
+  nothing, and its `cause` may be any of the three kinds. Not an input error, so
+  `hydrateWithBackoff` waits it out — the floor says nothing about the caller's own key map.
+- **A store-rejected input error is a `ConfigInputError` with `reachedStore: true`, not a
+  subclass.** `instanceof ConfigInputError` keeps one meaning — don't wait, waiting won't fix it —
+  and `hydrateWithBackoff` still stops on both. The only difference is quota, which is the floor's
+  business, so a property the floor reads is enough; a subclass would be a second export meaning
+  the same thing to every catch.
+- **`hydrationStatus().nextAttemptAt` uses the floor of the attempt that armed it.** The status
+  has no caller, and `hydrate()` enforces each caller's own `retryFloorMs`, so a caller passing a
+  different value sees a different window in its own `ConfigFloorError`. Documented, not
+  reconciled: a process passing one value, or none, sees the two agree.
+- **One key map per process is the supported shape. Known limitation, deferred to `1.0.0`.** The
+  floor is global because the quota is, so a key map that fails on every attempt holds the floor
+  shut for every other key map in the process, and a `hydrateWithBackoff` loop for another map can
+  be starved by it for as long as that lasts. Not changed in `0.2.0`: making the floor per key map
+  would spend the quota per map, which is the failure the floor exists to prevent.
+- **Timing options are validated before any request.** A NaN `retryFloorMs` makes every floor
+  comparison false — the floor fails open — and a zero or NaN backoff delay spins. Large finite
+  floors are allowed; `sleep()` steps waits past 2^31-1 ms, which `setTimeout` turns into 1 ms.
+  `timeoutMs` is capped at 2^31-1 because the provider hands it to `setTimeout` unstepped.
+- **Writes are all or nothing.** Every entry is checked before `process.env` is touched, with no
+  await in between, so a rejection means the environment is as it was.
+- **The logger is per attempt, not per call.** The call that starts an attempt logs it; joiners
+  and memo hits log nothing. Documented rather than fixed: a process-level `configureHydration()`
+  would be API for a problem a caller solves by passing a process-level logger.
 
 ## Conventions
 
 - TypeScript strict; build with `tsup`, emit esm + cjs + `.d.ts`; `files: ["dist/"]`.
 - Tests are **vitest**, no live Azure — fake the provider's `load()` at the module boundary.
   Every invariant above gets a test that fails if it is relaxed: single attempt, failure not
-  memoised, floor enforced, cause surfaced, no wildcard selector reaches the provider.
+  memoised, floor enforced, cause surfaced, no wildcard selector reaches the provider. So does
+  every decision above: the floor error's class and `retryAfterMs`, the floor armed by a
+  store-rejected input error and not by a pre-request one, zero `load()` calls from
+  `hydrationStatus()` in every state, all-or-nothing writes, the `WEBSITE_INSTANCE_ID` default in
+  both directions, the floor margin against a timer firing early, `hydrateWithBackoff` sleeping
+  through a floor rejection without reporting it and reporting the real wait after a failure, a
+  huge floor slept in steps, invalid timing options refused, unescaped commas refused and escaped
+  ones allowed, and the wire evidence reported as facts and candidates, counted at the timeout.
 - **Error fixtures must match the provider's real shape**, which `test/helpers.ts` records with
   source line numbers. A fixture easier to unwrap than reality certifies the bug it was written
   to catch.
@@ -137,14 +209,21 @@ without a real reason recorded in the commit message.
 - Public API stays small and additive. Pre-1.0 it can change; after 1.0 a change to any of the
   four invariants is a major.
 - Keep the two implementations behaviourally identical. Same option names in snake_case, same
-  defaults, same error semantics. A divergence is a bug in whichever half moved.
+  defaults, same error semantics. A divergence is a bug in whichever half moved. **Every 0.2.0
+  behaviour is part of the spec the Python half must match** — `ConfigFloorError` with
+  `retry_after_ms`, `DEFAULT_RETRY_FLOOR_MS`, `reached_store` and the floor it arms,
+  `hydration_status()` that never makes a request, `loaded_at`, all-or-nothing writes, the
+  `WEBSITE_INSTANCE_ID` default, the per-attempt logger. `CHANGELOG.md` lists them.
 
 ## Status
 
 - [x] TypeScript `src/index.ts` — `hydrate`, `hydrateWithBackoff`, `ConfigLoadError`, `resetHydration`
 - [x] Tests for the four invariants
-- [ ] First consumer: an Azure Functions app, on its staging slot, from an `npm pack` tarball
-- [ ] Second consumer: a container web app, converted from its inlined copy
+- [x] First consumer: an Azure Functions app, consuming `0.1.0` from the registry. Its findings
+      are `BACKLOG.md`, all shipped in `0.2.0`
+- [ ] `0.2.0` published, and the first consumer's workarounds deleted (`CHANGELOG.md` lists them)
+- [ ] Second consumer: a container web app, converted from its inlined copy. It chooses the
+      "deployed" signal for its host, or passes `localOverridesWin: false`
 - [ ] `1.0.0` published to npm — only after both consumers run on it
 - [ ] Python half, then its own second consumer
 
@@ -153,5 +232,5 @@ the ESM and the CJS build gets two of it and `resetHydration()` clears one. A `g
 registry fixes it; whether two *versions* of the package in one graph should share state needs
 deciding first.
 
-Two copies of the hydrator exist in consumer repositories today. They are the specification;
-read them before writing this one, and delete them as each consumer converts.
+The second consumer's inlined copy of the hydrator is still part of the specification: read it
+before changing behaviour it relies on, and delete it when that consumer converts.

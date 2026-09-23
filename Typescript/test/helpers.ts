@@ -67,14 +67,41 @@ export function providerNonFailoverableError(underlying: Error): Error {
   return new Error('The load operation failed.', { cause: underlying });
 }
 
-/** A Key Vault reference the provider could not resolve. It preserves the cause here. */
-export function providerKeyVaultError(underlying: Error): Error {
-  const referenceError = new Error('Failed to resolve Key Vault reference.', { cause: underlying });
-  referenceError.name = 'KeyVaultReferenceError';
-  return new Error('The load operation failed.', { cause: referenceError });
+/*
+ * A Key Vault reference the provider cannot parse or resolve has no shape of its own at startup.
+ * keyVaultKeyValueAdapter.js:30/50 and keyVaultSecretProvider.js:49 wrap it in a
+ * KeyVaultReferenceError, which the retry loop (appConfigurationImpl.js:322-326) finds neither an
+ * input error nor a RestError, so it re-reads the store and retries until the startup timeout
+ * wins: the caller gets providerTimeoutError(), after the store answered 200. Verified against
+ * 2.6.0 with a local fake store, for an unparseable URI, a malformed secret path and an
+ * unreachable vault. An earlier fixture here — the load error wrapping the KeyVaultReferenceError
+ * wrapping a 403 — was a shape 2.6.0 never produces. Use failingLoadAfterRead(providerTimeoutError()).
+ */
+
+/** What the provider says about a connection string it cannot parse. */
+export const INVALID_CONNECTION_STRING =
+  "Invalid connection string. Valid connection strings should match the regex 'Endpoint=(.*);Id=(.*);Secret=(.*)'.";
+
+/**
+ * An input error the provider raises before any request. ConfigurationClientManager checks the
+ * connection string and endpoint in its constructor (configurationClientManager.js:58, :66), which
+ * load.js calls before its try, so the ArgumentError — or the TypeError from `new URL` — arrives
+ * bare, unwrapped and unpadded. Verified against 2.6.0 for both. (The selector checks,
+ * appConfigurationImpl.js:853-859, throw the same bare shape after a five-second pad; hydrate() now
+ * rejects a label with `*` or `,` itself, so they are no longer reached.)
+ */
+export function providerPreRequestError(message: string = INVALID_CONNECTION_STRING): Error {
+  const argumentError = new Error(message);
+  argumentError.name = 'ArgumentError';
+  return argumentError;
 }
 
-/** The provider's own input error, which no amount of retrying can fix. */
+/**
+ * An input error raised inside the initial load: #initializeWithRetryPolicy re-throws a top-level
+ * ArgumentError, TypeError or RangeError at once (appConfigurationImpl.js:322), and load() wraps it
+ * (:218). Nothing we found in store data reaches this in 2.6.0 — see the Key Vault note above — but
+ * the path exists, and when it is taken after the read, the attempt has spent quota.
+ */
 export function providerArgumentError(message: string): Error {
   const argumentError = new Error(message);
   argumentError.name = 'ArgumentError';
@@ -137,6 +164,78 @@ export function failingLoad(failure: WireFailure, thrown: Error = providerFailov
           };
         })
         .catch(() => undefined);
+    }
+    throw thrown;
+  };
+}
+
+/**
+ * A `load()` whose store read succeeds on the wire — the policies see a 200 for each list request,
+ * one per selector unless `answered` says otherwise — and which then throws `thrown`, as the
+ * provider does when what it read cannot be used. On the endpoint path it asks for a token first,
+ * as the real one does before its first request.
+ */
+export function failingLoadAfterRead(thrown: Error, answered?: number) {
+  return async (...args: unknown[]): Promise<never> => {
+    if (args.length === 3) {
+      const credential = args[1] as { getToken: (s: string) => Promise<unknown> };
+      await credential.getToken('https://example.invalid/.default');
+    }
+    const count = answered ?? (args[args.length - 1] as { selectors: unknown[] }).selectors.length;
+    for (const { policy } of policiesFrom(args)) {
+      for (let i = 0; i < count; i++) {
+        await policy.sendRequest({ url: 'https://example.invalid/kv', method: 'GET' }, async () => ({
+          status: 200,
+          bodyAsText: '{"items":[]}',
+          headers: {},
+        }));
+      }
+    }
+    throw thrown;
+  };
+}
+
+/**
+ * A `load()` with a startup timeout shorter than the provider's five-second hold: its one request
+ * is still in flight when the timeout fires, is answered `answerAfterMs` later, and only then does
+ * the rejection arrive — as 2.6.0 does when `timeoutMs` is under five seconds.
+ */
+export function loadAnsweredAfterTimeout(answerAfterMs: number, thrown: Error = providerTimeoutError()) {
+  return async (...args: unknown[]): Promise<never> => {
+    for (const { policy } of policiesFrom(args)) {
+      await policy.sendRequest(
+        { url: 'https://example.invalid/kv', method: 'GET' },
+        () =>
+          new Promise(resolve =>
+            setTimeout(() => resolve({ status: 200, bodyAsText: '{"items":[]}', headers: {} }), answerAfterMs)
+          )
+      );
+    }
+    throw thrown;
+  };
+}
+
+/**
+ * A `load()` that sends `answered` requests the store answers with 200, then one that never comes
+ * back, then throws `thrown` — the startup timeout winning while that request is still in flight.
+ * The provider passes no abort signal to its list requests, so behind a blackholed private endpoint
+ * or a store that answers one selector and hangs on the next, this is what the policy sees.
+ */
+export function failingLoadWithHangingRequest(thrown: Error, answered = 0) {
+  return async (...args: unknown[]): Promise<never> => {
+    const [entry] = policiesFrom(args);
+    if (entry) {
+      for (let i = 0; i < answered; i++) {
+        await entry.policy.sendRequest({ url: 'https://example.invalid/kv', method: 'GET' }, async () => ({
+          status: 200,
+          bodyAsText: '{"items":[]}',
+          headers: {},
+        }));
+      }
+      void entry.policy.sendRequest(
+        { url: 'https://example.invalid/kv', method: 'GET' },
+        () => new Promise<never>(() => {})
+      );
     }
     throw thrown;
   };

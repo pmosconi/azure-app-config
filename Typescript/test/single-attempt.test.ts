@@ -29,6 +29,7 @@ beforeEach(() => {
   process.env.APP_CONFIG_ENDPOINT = 'https://example.invalid';
   process.env.APP_CONFIG_LABEL = 'prod';
   delete process.env.NODE_ENV;
+  delete process.env.WEBSITE_INSTANCE_ID;
 });
 
 afterEach(() => restoreEnv(env));

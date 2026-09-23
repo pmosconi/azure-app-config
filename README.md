@@ -7,14 +7,14 @@ Available for TypeScript and Python from one repository, on the model of a paire
 npm + PyPI package.
 
 ```bash
-npm install @actvalue/azure-app-config       # TypeScript — in development
+npm install @actvalue/azure-app-config       # TypeScript
 pip install actvalue.azure-app-config        # Python — not yet written
 ```
 
-> **Status: pre-1.0, unpublished.** The TypeScript half is being written against two real
-> consumers — an Azure Functions app and a container web app — and `1.0.0` is published only
-> once both run on it. The Python half follows. Until then, consume it from an `npm pack`
-> tarball, not from the registry.
+> **Status: pre-1.0.** The TypeScript half is on npm and runs in its first consumer, an Azure
+> Functions app. `1.0.0` follows once a second, a container web app, runs on it too. Until then a
+> minor version may break things; [`CHANGELOG.md`](CHANGELOG.md) says what, and which workarounds
+> each release lets you delete. The Python half follows.
 
 ## What it does
 
@@ -41,7 +41,7 @@ Everything else — endpoint, label, credential — comes from the environment b
 | `APP_CONFIG_ENDPOINT` | Store endpoint, read with `DefaultAzureCredential` | yes, unless a connection string is set |
 | `APP_CONFIG_LABEL` | The one label to read (`prod`, `staging`, …) | yes |
 | `APP_CONFIG_CONNECTION_STRING` | Access-key fallback for runs with no identity to borrow | no |
-| `NODE_ENV` | `development` inverts precedence — see below | no |
+| `WEBSITE_INSTANCE_ID` | Injected by App Service and Azure Functions. Its absence means a developer machine, where precedence inverts — see below | set by the platform |
 
 ## Why not just call the provider
 
@@ -73,7 +73,8 @@ promise makes the first attempt the only one. Not caching it at all means every 
 re-attempts on every invocation, and on the Free SKU (1,000 requests a day, then HTTP 429 to
 every reader until midnight UTC) a handful of triggers spend the daily quota in minutes and take
 down every other consumer of the store with them. So after a failure `hydrate()` refuses to
-re-attempt for `retryFloorMs` and re-throws the last error instead.
+re-attempt for `retryFloorMs`, and rejects with a `ConfigFloorError` instead — its own class, so a
+caller can tell it from a fresh failure, carrying how long until the floor opens.
 
 ## Two shapes
 
@@ -121,27 +122,100 @@ Module-scope initialisation has to become lazy for this to work — a client con
 time reads the environment before hydration can fill it. That is a change in your application,
 not something a package can do for you.
 
-If you use the v4 `app.hook.appStart()` hook, verify on your worker version that it completes
-before module-scope code runs. If the ordering does not hold, lazy initialisation is the
-guarantee and the hook is only an optimisation.
+**An `app.hook.appStart()` hook is an early start, never the guarantee.** On the v4 Node worker,
+`startApp()` first loads every entry-point file — which runs all module-scope code — and only then
+runs the `appStart` hooks, and it awaits them before it answers the host's `WorkerInitRequest`. So
+a hook runs after every import, and blocks worker initialisation while it runs. Never throw from
+one and never await long work in one: start hydration and let it go. Lazy initialisation is the
+guarantee.
+
+```ts
+app.hook.appStart(() => {
+  void hydrate({ keys: KEYS }).catch(() => {});   // an early start; handlers still await hydrate()
+});
+```
+
+**Inside the retry floor, wait — never a bare rethrow.** After a failed attempt, every call for
+`retryFloorMs` rejects with a `ConfigFloorError` and sends nothing to the store. A handler that
+rethrows it abandons the message, Service Bus redelivers it at once, and every redelivery fails the
+same way within milliseconds: `maxDeliveryCount` is spent in seconds, and every message a cold
+worker receives during a store failure is dead-lettered. Wait `retryAfterMs`, make one more
+attempt, and only then let the invocation fail:
+
+```ts
+import { ConfigFloorError, hydrate } from '@actvalue/azure-app-config';
+
+async function configured(): Promise<void> {
+  try {
+    await hydrate({ keys: KEYS });
+  } catch (error) {
+    if (!(error instanceof ConfigFloorError)) throw error;
+    await new Promise(resolve => setTimeout(resolve, error.retryAfterMs));
+    await hydrate({ keys: KEYS });    // one more attempt; if it fails, the message is retried
+  }
+}
+```
+
+Waiting exactly `retryAfterMs` is enough. It is the time until the floor opens rounded up, plus a
+50 ms margin, so a timer that fires a millisecond early still lands outside the floor. The pattern
+assumes `retryFloorMs` sits well inside the invocation's timeout, as the 30 s default does; a
+handler cannot wait out a floor longer than its invocation. Invocations
+that wake together and ask for the same keys share one attempt. The default floor,
+`DEFAULT_RETRY_FLOOR_MS`, is 30 s — well inside a function's timeout.
+
+**`hydrateWithBackoff` does not belong inside an invocation.** It returns only once the store
+answers, which can be long after the invocation's own timeout.
+
+**Report configuration health without spending quota.** A health endpoint that calls `hydrate()`
+may start a store attempt on every ping, and on a Free store pings during an outage spend the day's
+requests within about an hour. `hydrationStatus()` reads what `hydrate()` has done and never makes
+a request:
+
+```ts
+import { hydrationStatus } from '@actvalue/azure-app-config';
+
+app.http('health', {
+  methods: ['GET'],
+  authLevel: 'anonymous',
+  handler: async () => {
+    const config = hydrationStatus(KEYS);
+    return {
+      status: config.state === 'failing' ? 503 : 200,
+      jsonBody: { config: config.state, loadedAt: config.loadedAt, nextAttemptAt: config.nextAttemptAt },
+    };
+  },
+});
+```
+
+`none` and `pending` are normal here: nothing is loaded until a handler or the hook asks.
+
+**The logger is per attempt, not per call.** An attempt logs through the `logger` of the call that
+started it; a call that joins it in flight, or is handed the memoised success, logs nothing through
+its own. So a per-invocation logger such as `InvocationContext` records the success line in
+whichever invocation happened to be first. Pass a process-level logger, or none, if that matters.
 
 ## Precedence: who wins when a variable is already set
 
-Everywhere but a developer machine, **the store wins** — it overwrites whatever the environment
-held, so a stale app setting or a leftover `.env` line cannot quietly beat the migrated value.
+Deployed, **the store wins** — it overwrites whatever the environment held, so a stale app setting
+or a leftover `.env` line cannot quietly beat the migrated value.
 
-Under `NODE_ENV=development` that inverts: a value already in the environment wins, so a `.env`
-line can point one variable at a local database without reaching into the store. This is safe
-because a Dockerfile that bakes `ENV NODE_ENV=production` means no deployed container can take
-the branch — and it is exactly why the label is its own variable and not derived from `NODE_ENV`.
-Those are two different questions about the same run. A staging container reading
-`NODE_ENV=production` from its own image would otherwise load production databases.
+On a developer machine that inverts: a value already in the environment wins, so a `.env` line can
+point one variable at a local database without reaching into the store. Precedence is decided
+before a key is called missing, so a `.env` line also stands in for a key that is not in the store
+yet — which is the point of reaching for it in the first place.
 
-Precedence is decided before a key is called missing, so under `NODE_ENV=development` a `.env`
-line also stands in for a key that is not in the store yet — which is the point of reaching for it
-in the first place.
+`localOverridesWin` is that escape hatch, and it is for local development only: false in every
+deployed environment, true locally. Its default is "not deployed", read on every attempt from
+`WEBSITE_INSTANCE_ID`, which App Service and Azure Functions inject on every instance and which
+`func start`, a plain `node` run and a test runner never set. **Any other host — Container Apps,
+Kubernetes, a VM — injects nothing this reads, so pass `localOverridesWin: false` there**, or the
+local environment beats the store.
 
-Set `localOverridesWin` explicitly if your application does not use `NODE_ENV` this way.
+`NODE_ENV` plays no part. In a Functions app it is an ordinary per-slot app setting that often
+means something else, and a staging slot carrying `development` would let leftover settings beat
+the store without a warning, so the staging run would prove nothing. For the same reason the label
+is its own variable and never derived from `NODE_ENV`: images bake `ENV NODE_ENV=production`, so a
+staging container would otherwise read the production label and load production databases.
 
 ## Why an explicit key map and not a prefix filter
 
@@ -149,7 +223,11 @@ Set `localOverridesWin` explicitly if your application does not use `NODE_ENV` t
 generally not the same string. And more seriously: **every Key Vault reference the provider
 loads, it also resolves.** A selector like `shared:*` therefore tries to resolve secrets your
 application holds no grant on, and turns another application's credential into your startup
-failure. One selector per key means nothing outside the map is ever fetched.
+failure. One selector per key means nothing outside the map is ever fetched. A comma is refused
+as firmly as `*`: App Configuration reads `a,b` as a filter matching both keys. Escaped, `\*` and
+`\,` match the literal character, and are allowed in a key. The label gets the same check,
+escapes included — the provider refuses any `*` or `,` in a label — because exactly one label is
+read.
 
 The values must be strings. A key-value with a JSON content type comes back from the provider
 parsed, and the provider's `get<string>()` does not prevent that — so an object would otherwise
@@ -161,7 +239,7 @@ by name alongside the absent ones.
 ### `hydrate(options): Promise<HydrationResult>`
 
 One attempt. Resolves once and is memoised on success; on failure the rejection is not cached,
-but a further attempt inside `retryFloorMs` re-throws the previous error without touching the
+but a further call inside `retryFloorMs` rejects with `ConfigFloorError` without touching the
 store.
 
 | Option | Default | |
@@ -171,14 +249,22 @@ store.
 | `endpoint` | `process.env.APP_CONFIG_ENDPOINT` | |
 | `connectionString` | `process.env.APP_CONFIG_CONNECTION_STRING` | Takes precedence when set |
 | `credential` | `new DefaultAzureCredential()` | |
-| `timeoutMs` | `15_000` | Provider startup timeout |
-| `retryFloorMs` | `30_000` | Minimum gap between attempts after a failure |
-| `localOverridesWin` | `process.env.NODE_ENV === 'development'` | |
-| `logger` | `console` | |
+| `timeoutMs` | `15_000` | Provider startup timeout. Finite, above 0, at most 2^31-1 |
+| `retryFloorMs` | `DEFAULT_RETRY_FLOOR_MS` (`30_000`) | Minimum gap between attempts after a failure. Finite, 0 or more — NaN would switch it off |
+| `localOverridesWin` | `!process.env.WEBSITE_INSTANCE_ID`, read on every attempt | Dev-only. Hosts other than App Service and Functions pass `false` |
+| `logger` | `console` | Per attempt: the call that starts an attempt logs it |
 
-Returns `{ label, applied, kept }` — which variables were written and which were left alone.
-Throws `ConfigLoadError` if the store cannot be read, `ConfigInputError` for a call no retry can
-fix, and a plain `Error` naming every key that was absent, empty, or not a string at that label.
+Returns `{ label, applied, kept, loadedAt }` — which variables were written, which were left
+alone, and when (milliseconds since the epoch). Throws `ConfigLoadError` if the store cannot be
+read, `ConfigInputError` for a call no retry can fix, `ConfigFloorError` inside the retry floor,
+and a plain `Error` naming every key that was absent, empty, or not a string at that label.
+
+All or nothing: every key is checked before anything is written, so a rejection leaves the
+environment exactly as it was.
+
+Every failure that reached the store arms the floor — a refused or failed read, a missing key,
+and an input error raised after the store had answered. Only input rejected before any request
+leaves it alone.
 
 A success is memoised against the `keys`/`label` pair it was made with, not globally: one worker
 process hosting several functions must not hand the second one the first one's result.
@@ -187,10 +273,56 @@ process hosting several functions must not hand the second one the first one's r
 
 Calls `hydrate` until it succeeds. `backoff` is `{ initialMs = 5_000, maxMs = 600_000, onError }`.
 It retries a failure the store could recover from for as long as that takes, and rejects
-immediately with `ConfigInputError` on one it cannot — a wildcard key, a missing label, a request
-the store rejects as malformed. A container looping forever on a typo looks exactly like one
-waiting out an outage, and only one of those is worth waiting for.
-**Long-lived processes only.**
+immediately with `ConfigInputError` on one it cannot — a wildcard or a comma in a key, a missing
+label, input the provider rejects as malformed. A container looping forever on a typo looks exactly
+like one waiting out an outage, and only one of those is worth waiting for. A missing key is
+retried: adding it to the store heals the process.
+
+A `ConfigFloorError` is not a failed attempt, and the loop does not treat it as one: it sleeps
+until the floor opens and calls again, without calling `onError`, logging a failure, or widening
+the delay. So the delay doubles once per real failure, and real attempts land on the floor's
+schedule. After a real failure, `onError`'s `nextDelayMs` and the default "retrying in" log say
+when the next attempt will really happen: the backoff delay, or the time until the floor opens if
+that is longer. `initialMs` and `maxMs` must be finite and above 0. A wait longer than
+`setTimeout` honours (about 24.8 days) is slept in steps, so a huge floor cannot spin the loop. **Long-lived processes only** — never inside a function invocation.
+
+### `hydrationStatus(keys, label?): HydrationStatus`
+
+What `hydrate()` has done for this key map and label. **Never makes a request and never starts an
+attempt**, in any state, so a health endpoint can call it on every ping. The label resolves as it
+does for `hydrate()`. Throws `ConfigInputError` for a call `hydrate()` would reject before any
+request: no keys, an unescaped `*` or `,` in a key, no label, or a `*` or `,` in the label. It
+does not check the endpoint or the timing options, and cannot run the provider's own pre-request
+checks.
+
+Returns `{ state, loadedAt?, failedAt?, lastError?, nextAttemptAt? }`, timestamps in milliseconds
+since the epoch:
+
+| `state` | Meaning |
+|---|---|
+| `loaded` | A success is memoised. `loadedAt` says when |
+| `pending` | An attempt is in flight. `failedAt`/`lastError` describe the failure before it, if any |
+| `failing` | The last attempt failed. `failedAt`/`lastError` are that attempt's, never a floor rejection |
+| `none` | No attempt yet for this key map and label |
+
+`nextAttemptAt` appears only in the `failing` and `none` states, and there only while the retry
+floor is closed, whichever key map armed it. It is when the floor opens, exactly, by the
+`retryFloorMs` of the attempt that armed it. `hydrate()` enforces each caller's own
+`retryFloorMs`, so a caller passing a different value sees a different window — its
+`ConfigFloorError.retryAfterMs` is measured with its own. Pass one value everywhere, or none, and
+the two agree.
+
+### `ConfigFloorError`
+
+What `hydrate()` rejects with inside the retry floor. Nothing was sent to the store. `retryAfterMs`
+is how long to wait: the time until the floor opens by this call's `retryFloorMs`, rounded up, plus
+a 50 ms margin, so a timer that fires slightly early still clears it. The floor itself is enforced
+exactly. `cause` is the error of the attempt that armed it. Deliberately neither a `ConfigLoadError` — nothing was attempted, and a count of load failures
+must not count it — nor a `ConfigInputError`, so `hydrateWithBackoff` waits it out.
+
+### `DEFAULT_RETRY_FLOOR_MS`
+
+`30_000`. The default `retryFloorMs`, exported so a caller can line up with it.
 
 ### `ConfigLoadError`
 
@@ -200,13 +332,18 @@ where one was seen; `observations` is every distinct failure seen on the wire du
 
 ### `ConfigInputError`
 
-A call no retry can fix: a wildcard key, an empty key map, no label, no endpoint, or a request the
-store rejected as malformed. `hydrateWithBackoff` re-throws it rather than looping, and it never
-arms the retry floor, because it never reached the store.
+A call no retry can fix: an unescaped `*` or `,` in a key, an empty key map, no label, a label
+with `*` or `,`, no endpoint, a timing option that is not a usable number, or input the provider
+rejected as malformed. `hydrateWithBackoff`
+re-throws it rather than looping. `reachedStore` says whether a response had already come back from
+the store: `false` means rejected before that, which spent nothing and leaves the retry floor
+alone; `true` means the provider rejected something after the store answered, and that attempt
+armed the floor like any other. On provider 2.6.0 it is `false` in practice — no store data we
+found reaches the provider's post-read input-error path — so it is there for a provider that does.
 
 ### `resetHydration()`
 
-Clears the memoised result. For tests.
+Clears the memoised results, the recorded failures and the retry floor. For tests.
 
 ## Development
 
@@ -225,15 +362,9 @@ azure-app-config/
 │   ├── package.json
 │   └── README.md
 ├── Python/                  # to follow
+├── CHANGELOG.md
 ├── Makefile
 └── README.md
-```
-
-Consumers take it from a tarball until `1.0.0` is published:
-
-```bash
-cd Typescript && npm pack
-cd ../../your-app && npm install ../azure-app-config/Typescript/actvalue-azure-app-config-0.1.0.tgz
 ```
 
 ## License

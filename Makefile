@@ -16,7 +16,7 @@ help:
 	@echo "  make format-py          - Format Python code"
 	@echo "  make build-ts           - Build TypeScript package"
 	@echo "  make build-py           - Build Python package"
-	@echo "  make pack-ts            - npm pack the TypeScript package (consumers use this until 1.0.0)"
+	@echo "  make pack-ts            - npm pack the TypeScript package (inspect the tarball before publishing)"
 	@echo "  make publish-ts         - Publish TypeScript to npm"
 	@echo "  make publish-py         - Publish Python to PyPI"
 	@echo "  make publish-py-test    - Publish Python to Test PyPI"

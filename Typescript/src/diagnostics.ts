@@ -36,10 +36,33 @@ export interface Diagnostics {
   readonly policy: PipelinePolicy;
   /** Every distinct failure seen on the wire during this attempt, in the order they happened. */
   observations(): FailureObservation[];
+  /**
+   * What became of the requests this attempt sent, SDK retries included, read at the moment it is
+   * called — so read it when the load rejects. See {@link Traffic}.
+   */
+  traffic(): Traffic;
+}
+
+/**
+ * Requests counted by outcome, not by departure. A request that left and never came back is not
+ * evidence that the store answered: the provider passes no abort signal to its list requests, so
+ * behind a blackholed private endpoint, or a store that answers one selector and hangs on the
+ * next, a request is still in flight when the startup timeout wins.
+ */
+export interface Traffic {
+  /** Requests the store answered with a response, of any status. */
+  answered: number;
+  /** Requests that failed in the transport — DNS, a refused connection, an abort. */
+  failed: number;
+  /** Requests sent and not yet settled either way. */
+  pending: number;
 }
 
 export function createDiagnostics(): Diagnostics {
   const observed: FailureObservation[] = [];
+  let sent = 0;
+  let answered = 0;
+  let failed = 0;
 
   const record = (observation: FailureObservation): void => {
     const already = observed.some(
@@ -54,8 +77,10 @@ export function createDiagnostics(): Diagnostics {
   const policy: PipelinePolicy = {
     name: 'actvalue-azure-app-config-diagnostics',
     async sendRequest(request: PipelineRequest, next: SendRequest): Promise<PipelineResponse> {
+      sent++;
       try {
         const response = await next(request);
+        answered++;
         // A 4xx or 5xx is a response, not a throw: the generated client turns it into a RestError
         // above the pipeline, and the provider then discards that RestError. This is the only
         // place the status is visible to us.
@@ -63,13 +88,18 @@ export function createDiagnostics(): Diagnostics {
         return response;
       } catch (error) {
         // A transport failure — DNS, refused connection, the startup timeout's abort.
+        failed++;
         record(fromTransportError(error));
         throw error;
       }
     },
   };
 
-  return { policy, observations: () => observed.slice() };
+  return {
+    policy,
+    observations: () => observed.slice(),
+    traffic: () => ({ answered, failed, pending: sent - answered - failed }),
+  };
 }
 
 /** Render observations as the `detail` of a {@link ConfigLoadError}. */

@@ -1,6 +1,6 @@
 {
   "name": "@actvalue/azure-app-config",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Hydrate process.env from Azure App Configuration, with the failure handling that platform actually needs",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

@@ -13,11 +13,14 @@ import {
   KEYS,
   fakeStore,
   failingLoad,
+  failingLoadAfterRead,
+  failingLoadWithHangingRequest,
   failingLoadWithNoRequest,
-  providerArgumentError,
+  loadAnsweredAfterTimeout,
+  INVALID_CONNECTION_STRING,
   providerFailoverError,
-  providerKeyVaultError,
   providerNonFailoverableError,
+  providerPreRequestError,
   providerTimeoutError,
   policiesFrom,
   respondingCredential,
@@ -49,6 +52,7 @@ beforeEach(() => {
   process.env.APP_CONFIG_ENDPOINT = 'https://example.invalid';
   process.env.APP_CONFIG_LABEL = 'prod';
   delete process.env.NODE_ENV;
+  delete process.env.WEBSITE_INSTANCE_ID;
 });
 
 afterEach(() => restoreEnv(env));
@@ -158,6 +162,104 @@ describe('the failure the provider discards', () => {
     expect(error.detail).not.toContain('clientOptions');
   });
 
+  /*
+   * When the store was asked and nothing failed, `detail` states what the wire showed — answered,
+   * in flight, against the number of selectors — and names every cause that leaves open. It never
+   * rules one out that the evidence cannot: these assert the facts and the candidates, not a
+   * single verdict.
+   */
+  async function silentFailure(load: (...args: unknown[]) => Promise<never>, extra = {}) {
+    loadMock.mockImplementation(load as never);
+    const error = (await hydrate({
+      keys: KEYS,
+      retryFloorMs: 0,
+      credential: respondingCredential(),
+      ...extra,
+    }).catch((e: unknown) => e)) as ConfigLoadError;
+    expect(error).toBeInstanceOf(ConfigLoadError);
+    expect(error.observations).toHaveLength(0);
+    expect(error.statusCode).toBeUndefined();
+    // Before requests were counted, every case here was blamed on clientOptions drift.
+    expect(error.detail).not.toContain('clientOptions');
+    expect(error.detail).not.toContain('credential is the suspect');
+    return error.detail;
+  }
+
+  it('reports a complete read with nothing in flight, and names a Key Vault reference', async () => {
+    // A Key Vault reference the provider cannot parse or resolve: every selector answered 200,
+    // then the provider retries the reference until the startup timeout.
+    const detail = await silentFailure(failingLoadAfterRead(providerTimeoutError()));
+
+    expect(detail).toContain('the store had answered 3 of the 3 requests');
+    expect(detail).toContain('0 were still in flight');
+    expect(detail).toContain('for 3 selectors');
+    expect(detail).toContain('Not ruled out: a Key Vault reference');
+    expect(detail).not.toContain('network path');
+  });
+
+  it('reports the same on the access-key path, where no token is in play', async () => {
+    process.env.APP_CONFIG_CONNECTION_STRING = 'Endpoint=https://example.invalid;Id=x;Secret=c2VjcmV0';
+    loadMock.mockImplementation(failingLoadAfterRead(providerTimeoutError()) as never);
+
+    const error = (await hydrate({ keys: KEYS, retryFloorMs: 0 }).catch(
+      (e: unknown) => e
+    )) as ConfigLoadError;
+
+    expect(error.detail).toContain('answered 3 of the 3 requests');
+    expect(error.detail).toContain('Key Vault reference');
+    expect(error.detail).not.toContain('the cause is unreported');
+  });
+
+  it('names the network and the store when a request never came back', async () => {
+    // Behind a blackholed private endpoint the provider's list request is still in flight when the
+    // timeout wins. No selector was answered, so no reference was ever resolved: Key Vault is out.
+    const detail = await silentFailure(failingLoadWithHangingRequest(providerTimeoutError()));
+
+    expect(detail).toContain('answered 0 of the 1 request');
+    expect(detail).toContain('1 was still in flight');
+    expect(detail).toContain('the network path to the store');
+    expect(detail).toContain('the store not answering');
+    expect(detail).not.toContain('Key Vault');
+  });
+
+  it('keeps the network in play when one selector was answered and the next hung', async () => {
+    const detail = await silentFailure(failingLoadWithHangingRequest(providerTimeoutError(), 1));
+
+    expect(detail).toContain('answered 1 of the 2 requests');
+    expect(detail).toContain('1 was still in flight');
+    expect(detail).toContain('the network path to the store');
+    expect(detail).not.toContain('Key Vault');
+  });
+
+  it('does not rule out a Key Vault re-read when a request is in flight after a full read', async () => {
+    // On 2.6.0 a broken reference makes the provider re-read the store every few seconds, so a
+    // re-read can be in flight when the timeout fires. That must not become "not its data".
+    const detail = await silentFailure(failingLoadWithHangingRequest(providerTimeoutError(), 3));
+
+    expect(detail).toContain('answered 3 of the 4 requests');
+    expect(detail).toContain('the network path to the store');
+    expect(detail).toContain('a Key Vault reference');
+    expect(detail).not.toContain('not its data');
+  });
+
+  it('says the reads had not finished when fewer selectors were answered and none is in flight', async () => {
+    const detail = await silentFailure(failingLoadAfterRead(providerTimeoutError(), 1));
+
+    expect(detail).toContain('answered 1 of the 1 request');
+    expect(detail).toContain('reads that had not finished');
+    expect(detail).not.toContain('Key Vault');
+  });
+
+  it('counts what was in flight when the startup timeout fired, not when the rejection came', async () => {
+    // With timeoutMs under five seconds the provider holds its rejection until five seconds after
+    // it started. A request answered in that gap must not turn "in flight" into "answered".
+    const detail = await silentFailure(loadAnsweredAfterTimeout(80), { timeoutMs: 20 });
+
+    expect(detail).toContain('when the startup timeout fired');
+    expect(detail).toContain('answered 0 of the 1 request');
+    expect(detail).toContain('1 was still in flight');
+  });
+
   it('names nothing when no token was ever requested', async () => {
     loadMock.mockImplementation(failingLoadWithNoRequest(providerTimeoutError()) as never);
 
@@ -201,20 +303,6 @@ describe('the failures the provider does preserve', () => {
     expect(error.detail).toContain('HTTP 404');
   });
 
-  it('reports an unresolvable Key Vault reference, which makes no failing store request', async () => {
-    loadMock.mockImplementation(
-      failingLoadWithNoRequest(providerKeyVaultError(restError(403, 'Forbidden'))) as never
-    );
-
-    const error = (await hydrate({ keys: KEYS, retryFloorMs: 0 }).catch(
-      (e: unknown) => e
-    )) as ConfigLoadError;
-
-    // The store read fine; the vault refused. The provider preserves this one, so it wins over
-    // anything the diagnostics policy did or did not see.
-    expect(error.detail).toContain('HTTP 403');
-    expect(error.statusCode).toBe(403);
-  });
 
   it('keeps the provider error as cause, unmodified', async () => {
     const provider = providerFailoverError();
@@ -256,15 +344,14 @@ describe('the failures the provider does preserve', () => {
 
 describe('input errors from the provider', () => {
   it('reports an ArgumentError as a ConfigInputError, not a load failure', async () => {
-    loadMock.mockImplementation(
-      failingLoadWithNoRequest(providerArgumentError('Invalid selector.')) as never
-    );
+    loadMock.mockImplementation(failingLoadWithNoRequest(providerPreRequestError()) as never);
 
     const error = await hydrate({ keys: KEYS, retryFloorMs: 0 }).catch((e: unknown) => e);
 
     expect(error).toBeInstanceOf(ConfigInputError);
     expect(error).not.toBeInstanceOf(ConfigLoadError);
-    expect((error as Error).message).toContain('Invalid selector.');
+    expect((error as Error).message).toContain(INVALID_CONNECTION_STRING);
+    expect((error as ConfigInputError).reachedStore).toBe(false);
   });
 });
 

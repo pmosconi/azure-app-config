@@ -28,8 +28,15 @@ beforeEach(() => {
   process.env.APP_CONFIG_LABEL = 'prod';
   delete process.env.APP_CONFIG_CONNECTION_STRING;
   delete process.env.NODE_ENV;
+  // Not deployed, unless a test says otherwise — which is what a test runner is.
+  delete process.env.WEBSITE_INSTANCE_ID;
   for (const variable of Object.values(KEYS)) delete process.env[variable];
 });
+
+/** What App Service and Azure Functions inject on every instance. The value is irrelevant. */
+function deployed(): void {
+  process.env.WEBSITE_INSTANCE_ID = 'a1b2c3d4e5f6';
+}
 
 afterEach(() => restoreEnv(env));
 
@@ -45,10 +52,35 @@ describe('writing the environment', () => {
       label: 'prod',
       applied: ['MONGO_URL', 'SERVICE_BUS_CONNECTION', 'HTTP_PORT'],
       kept: [],
+      loadedAt: expect.any(Number),
     });
   });
 
-  it('overwrites a value already in the environment — the store wins', async () => {
+  it('says when it loaded', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-09-20T00:00:00Z'));
+    try {
+      loadMock.mockResolvedValue(fakeStore() as never);
+
+      const result = await hydrate({ keys: KEYS });
+
+      expect(result.loadedAt).toBe(Date.parse('2026-09-20T00:00:00Z'));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+/**
+ * localOverridesWin is a dev-only escape hatch: false in every deployed environment, true
+ * locally. Its default is "not deployed", read from WEBSITE_INSTANCE_ID, and NODE_ENV plays no
+ * part — in a Functions app NODE_ENV is an ordinary per-slot setting, and a staging slot carrying
+ * `development` let leftover settings beat the store without a word, so the run proved nothing.
+ */
+describe('precedence', () => {
+  it('lets the store win when deployed — even under NODE_ENV=development', async () => {
+    deployed();
+    process.env.NODE_ENV = 'development';
     process.env.MONGO_URL = 'mongodb://stale.invalid/app';
     loadMock.mockResolvedValue(fakeStore() as never);
 
@@ -56,10 +88,22 @@ describe('writing the environment', () => {
 
     expect(process.env.MONGO_URL).toBe(VALUES['shared:mongoUrl']);
     expect(result.kept).toEqual([]);
+    expect(result.applied).toContain('MONGO_URL');
   });
 
-  it('keeps the local value under NODE_ENV=development', async () => {
-    process.env.NODE_ENV = 'development';
+  it('lets the store win when deployed under any other NODE_ENV too', async () => {
+    deployed();
+    process.env.NODE_ENV = 'test';
+    process.env.HTTP_PORT = '9000';
+    loadMock.mockResolvedValue(fakeStore() as never);
+
+    await hydrate({ keys: KEYS });
+
+    expect(process.env.HTTP_PORT).toBe('8080');
+  });
+
+  it('keeps the local value when not deployed — even under NODE_ENV=production', async () => {
+    process.env.NODE_ENV = 'production';
     process.env.MONGO_URL = 'mongodb://127.0.0.1:27017/local';
     loadMock.mockResolvedValue(fakeStore() as never);
 
@@ -70,8 +114,32 @@ describe('writing the environment', () => {
     expect(result.applied).toEqual(['SERVICE_BUS_CONNECTION', 'HTTP_PORT']);
   });
 
-  it('takes localOverridesWin from the caller when it is given', async () => {
-    process.env.NODE_ENV = 'production';
+  it('treats an empty WEBSITE_INSTANCE_ID as not deployed', async () => {
+    process.env.WEBSITE_INSTANCE_ID = '';
+    process.env.HTTP_PORT = '9000';
+    loadMock.mockResolvedValue(fakeStore() as never);
+
+    const result = await hydrate({ keys: KEYS });
+
+    expect(result.kept).toEqual(['HTTP_PORT']);
+  });
+
+  it('reads the signal on every attempt, not once at import', async () => {
+    process.env.HTTP_PORT = '9000';
+    loadMock.mockResolvedValue(fakeStore() as never);
+
+    const local = await hydrate({ keys: KEYS });
+    resetHydration();
+    deployed();
+    const remote = await hydrate({ keys: KEYS });
+
+    expect(local.kept).toEqual(['HTTP_PORT']);
+    expect(remote.kept).toEqual([]);
+    expect(process.env.HTTP_PORT).toBe('8080');
+  });
+
+  it('takes localOverridesWin: true from the caller on a deployed instance', async () => {
+    deployed();
     process.env.HTTP_PORT = '9000';
     loadMock.mockResolvedValue(fakeStore() as never);
 
@@ -81,11 +149,23 @@ describe('writing the environment', () => {
     expect(result.kept).toEqual(['HTTP_PORT']);
   });
 
+  it('takes localOverridesWin: false from the caller on a host with no signal', async () => {
+    // Container Apps, Kubernetes, a VM: nothing injects WEBSITE_INSTANCE_ID, so the default reads
+    // "not deployed". Those hosts pass false, and the store wins.
+    process.env.NODE_ENV = 'development';
+    process.env.HTTP_PORT = '9000';
+    loadMock.mockResolvedValue(fakeStore() as never);
+
+    const result = await hydrate({ keys: KEYS, localOverridesWin: false });
+
+    expect(process.env.HTTP_PORT).toBe('8080');
+    expect(result.kept).toEqual([]);
+  });
+
   it('lets a local value stand in for a key the store has not got yet', async () => {
     // The README promises a .env line can point one variable at a local database "without
     // reaching into the store". Deciding precedence after the missing-key check broke that: the
     // load failed on a key the caller had already supplied.
-    process.env.NODE_ENV = 'development';
     process.env.HTTP_PORT = '3000';
     loadMock.mockResolvedValue(
       fakeStore({
@@ -101,7 +181,6 @@ describe('writing the environment', () => {
   });
 
   it('still fails on a missing key the local environment does not supply', async () => {
-    process.env.NODE_ENV = 'development';
     loadMock.mockResolvedValue(
       fakeStore({ 'shared:mongoUrl': VALUES['shared:mongoUrl']! }) as never
     );
@@ -110,7 +189,6 @@ describe('writing the environment', () => {
   });
 
   it('treats an empty local value as absent', async () => {
-    process.env.NODE_ENV = 'development';
     process.env.HTTP_PORT = '';
     loadMock.mockResolvedValue(fakeStore() as never);
 
@@ -151,6 +229,7 @@ describe('missing keys', () => {
       /myapp:httpPort .*a JSON object rather than a string/
     );
     expect(process.env.HTTP_PORT).toBeUndefined();
+    expect(process.env.MONGO_URL).toBeUndefined();
   });
 
   it('refuses a number as firmly as an object', async () => {
@@ -161,16 +240,45 @@ describe('missing keys', () => {
     );
   });
 
-  it('writes the keys it did find before it throws', async () => {
-    // Today's copy collects the missing names and then throws, leaving what it read in place.
-    // A caller that treats the throw as fatal — every documented shape does — never observes
-    // the partial write, and a caller that retries overwrites it.
+  it('writes nothing when any key is unusable — all or nothing', async () => {
+    // 0.1.0 wrote each usable value as it went and threw afterwards, so a rejection left the
+    // environment half-written, and a process that carried on — a health path, a partial
+    // feature — ran on a mix of store values and old ones.
     loadMock.mockResolvedValue(fakeStore({ 'shared:mongoUrl': VALUES['shared:mongoUrl']! }) as never);
 
-    await expect(hydrate({ keys: KEYS, retryFloorMs: 0 })).rejects.toThrow();
+    await expect(hydrate({ keys: KEYS, retryFloorMs: 0 })).rejects.toThrow(/Missing key-values/);
 
-    expect(process.env.MONGO_URL).toBe(VALUES['shared:mongoUrl']);
+    expect(process.env.MONGO_URL).toBeUndefined();
+    expect(process.env.SERVICE_BUS_CONNECTION).toBeUndefined();
     expect(process.env.HTTP_PORT).toBeUndefined();
+  });
+
+  it('leaves a value it would have overwritten exactly as it was', async () => {
+    deployed();
+    process.env.MONGO_URL = 'mongodb://stale.invalid/app';
+    process.env.SERVICE_BUS_CONNECTION = 'Endpoint=sb://stale.invalid/';
+    loadMock.mockResolvedValue(fakeStore({ ...VALUES, 'myapp:httpPort': '' }) as never);
+    const before = snapshotEnv();
+
+    await expect(hydrate({ keys: KEYS, retryFloorMs: 0 })).rejects.toThrow(/myapp:httpPort/);
+
+    expect(process.env).toEqual(before);
+  });
+
+  it('keeps hydrateWithBackoff retrying, and writes only once every key is there', async () => {
+    loadMock
+      .mockResolvedValueOnce(fakeStore({ 'shared:mongoUrl': VALUES['shared:mongoUrl']! }) as never)
+      .mockResolvedValue(fakeStore() as never);
+    const seenOnError: (string | undefined)[] = [];
+
+    const result = await hydrateWithBackoff(
+      { keys: KEYS, retryFloorMs: 0 },
+      { initialMs: 1, maxMs: 2, onError: () => seenOnError.push(process.env.MONGO_URL) }
+    );
+
+    expect(seenOnError).toEqual([undefined]);
+    expect(result.applied).toEqual(['MONGO_URL', 'SERVICE_BUS_CONNECTION', 'HTTP_PORT']);
+    expect(process.env.MONGO_URL).toBe(VALUES['shared:mongoUrl']);
   });
 });
 
