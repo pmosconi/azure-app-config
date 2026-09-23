@@ -131,9 +131,22 @@ without a real reason recorded in the commit message.
 - **`timeoutMs` defaults to 15 s, not the provider's ~100 s.** App Service gives a container less
   than 100 s to answer its first ping, so the provider's default means the platform kills you
   before you can report the failure.
-- **Backoff caps at 600 s.** At a 60 s cap one stuck app spends the Free store's daily quota in
-  ~5 hours; at 600 s it is a few dozen requests a day. Nothing needs a faster poll — RBAC
-  propagation is minutes in both directions, so a restored grant is not a restored application.
+- **Backoff caps at 600 s. The cap bounds attempts, not requests.** Per-attempt cost depends on
+  the failure, measured on provider 2.6.0: a 403 ≈ 1 request (the provider backs its client off
+  after it, so its later passes inside the attempt send nothing); unreachable 0; a failure after
+  a full read — a missing key — one per key, as a success. Under a persistent 403 attempts start
+  at ~0, 45, 90, 135, 190, 285, 460, 795 s, then every ~615 s: ~140 requests a day, 14% of the
+  Free tier. A persistent post-read failure settles to one attempt every ~600 s, ~144 a day, so
+  ~144 × keys requests a day: past 1,000 from 7 keys, from one process. At a 60 s cap it would be
+  over 1,100 attempts a day, past the quota even at one request each. Nothing needs a faster poll
+  — RBAC propagation is minutes in both directions, so a restored grant is not a restored
+  application. The provider's `Failed to load … Retrying in 5000 ms` warnings (~3 per attempt)
+  are its loop inside the startup timeout, not this schedule.
+- **The floor alone bounds `hydrate()` callers on message triggers:** at most one attempt per
+  floor window per process — up to 2,880 a day per process at the 30 s default while a failure
+  persists and messages keep arriving, each costing as above. A Functions app on a Free store
+  weighs that against its instance and key counts when it chooses `retryFloorMs`. Documented in
+  `0.2.1`; no default changed.
 - **The label is its own variable, never derived from `NODE_ENV`.** Images bake
   `ENV NODE_ENV=production`, so a staging container would read the production label and hit
   production databases. And in a Functions app `NODE_ENV` is an ordinary per-slot setting that
@@ -154,7 +167,16 @@ without a real reason recorded in the commit message.
   a Functions slot is free to carry that value, which let leftover settings beat the store on
   staging without a warning. No Container Apps or Kubernetes signal yet — the only known hosts are
   App Service and Functions — so every other host must pass `localOverridesWin: false`, and the
-  docs say so. Add a signal only with a consumer on that host.
+  docs say so. Add a signal only with a consumer on that host. **The success line states the mode
+  and why** (`0.2.1`), kept or not, after the variable list so the `0.2.0` prefix is unchanged:
+  `…, label prod: A, B (store wins: WEBSITE_INSTANCE_ID present)`, `(local wins:
+  WEBSITE_INSTANCE_ID absent)` — empty counts as absent — or `(… wins: localOverridesWin option
+  true|false)` when the option is passed. The reason is the *effective* decision, never the raw
+  option: the string `"false"` is truthy, so it says `local wins: localOverridesWin option true`;
+  `null` falls through to the signal, as `??` does, and the reason names the signal. Otherwise a
+  missing signal shows first as a stale value winning, and a consumer with no local settings left
+  can never confirm the signal. Names only, never a value; still one `logger.log` line per
+  successful attempt.
 - **`ConfigFloorError` extends `Error`, not `ConfigLoadError` or `ConfigInputError`.** A catch on
   `ConfigLoadError` means "a store attempt just failed" and counts it; a floor rejection attempted
   nothing, and its `cause` may be any of the three kinds. Not an input error, so
@@ -164,6 +186,13 @@ without a real reason recorded in the commit message.
   and `hydrateWithBackoff` still stops on both. The only difference is quota, which is the floor's
   business, so a property the floor reads is enough; a subclass would be a second export meaning
   the same thing to every catch.
+- **`hydrateWithBackoff` stops on a `reachedStore: true` input error too — decided in `0.2.1`,
+  `BACKLOG.md` item 10.** `reachedStore` is `answered > 0` for a response of any status, and the
+  input classification covers a `TypeError` or `RangeError` anywhere in the chain, so it does not
+  prove a store-side defect: retrying could loop for ever on one no store fix heals. And
+  `ConfigInputError` means "don't wait" wherever it is caught, and `onError` never receives one;
+  a consumer whose `onError` treats it as fatal relies on that. Unreachable on provider 2.6.0;
+  revisit if a provider version can produce it.
 - **`hydrationStatus().nextAttemptAt` uses the floor of the attempt that armed it.** The status
   has no caller, and `hydrate()` enforces each caller's own `retryFloorMs`, so a caller passing a
   different value sees a different window in its own `ConfigFloorError`. Documented, not
@@ -196,6 +225,8 @@ without a real reason recorded in the commit message.
   through a floor rejection without reporting it and reporting the real wait after a failure, a
   huge floor slept in steps, invalid timing options refused, unescaped commas refused and escaped
   ones allowed, and the wire evidence reported as facts and candidates, counted at the timeout.
+  And from `0.2.1`: the success line's precedence mode in all four cases (signal present or
+  absent, option true or false), the string `"false"` and `null`, and the `0.2.0` prefix intact.
 - **Error fixtures must match the provider's real shape**, which `test/helpers.ts` records with
   source line numbers. A fixture easier to unwrap than reality certifies the bug it was written
   to catch.
@@ -213,7 +244,11 @@ without a real reason recorded in the commit message.
   behaviour is part of the spec the Python half must match** — `ConfigFloorError` with
   `retry_after_ms`, `DEFAULT_RETRY_FLOOR_MS`, `reached_store` and the floor it arms,
   `hydration_status()` that never makes a request, `loaded_at`, all-or-nothing writes, the
-  `WEBSITE_INSTANCE_ID` default, the per-attempt logger. `CHANGELOG.md` lists them.
+  `WEBSITE_INSTANCE_ID` default, the per-attempt logger. So is the `0.2.1` success line: the
+  `0.2.0` prefix, then ` (store|local wins: <reason>)` after the list, word for word, with the
+  reason built from the effective decision (`local_overrides_win option true|false`, or the
+  signal when the option is `None`), and `hydrate_with_backoff` still re-raising every
+  `ConfigInputError`. `CHANGELOG.md` lists them.
 
 ## Status
 
@@ -221,9 +256,13 @@ without a real reason recorded in the commit message.
 - [x] Tests for the four invariants
 - [x] First consumer: an Azure Functions app, consuming `0.1.0` from the registry. Its findings
       are `BACKLOG.md`, all shipped in `0.2.0`
-- [ ] `0.2.0` published, and the first consumer's workarounds deleted (`CHANGELOG.md` lists them)
-- [ ] Second consumer: a container web app, converted from its inlined copy. It chooses the
-      "deployed" signal for its host, or passes `localOverridesWin: false`
+- [x] `0.2.0` published, and the first consumer's workarounds deleted (`CHANGELOG.md` lists them)
+- [x] Second consumer: a container web app on App Service, converted from its inlined copy onto
+      `0.2.0` with no library change. The default `WEBSITE_INSTANCE_ID` signal was confirmed in
+      production inside the container under pm2-runtime, so it passes no option. Its findings are
+      `BACKLOG.md` items 8–11
+- [x] Decide `BACKLOG.md` items 8–11: 8, 9 and 11 shipped in `0.2.1`, a patch release no
+      consumer has to change code for; 10 decided not done
 - [ ] `1.0.0` published to npm — only after both consumers run on it
 - [ ] Python half, then its own second consumer
 

@@ -11,10 +11,11 @@ npm install @actvalue/azure-app-config       # TypeScript
 pip install actvalue.azure-app-config        # Python — not yet written
 ```
 
-> **Status: pre-1.0.** The TypeScript half is on npm and runs in its first consumer, an Azure
-> Functions app. `1.0.0` follows once a second, a container web app, runs on it too. Until then a
-> minor version may break things; [`CHANGELOG.md`](CHANGELOG.md) says what, and which workarounds
-> each release lets you delete. The Python half follows.
+> **Status: pre-1.0.** The TypeScript half is on npm and runs in production in two consumers, both
+> on `0.2.0`: an Azure Functions app and a container web app on App Service. `1.0.0` is published
+> once both run on it. Until then a minor version may break things;
+> [`CHANGELOG.md`](CHANGELOG.md) says what, and which workarounds each release lets you delete.
+> The Python half follows.
 
 ## What it does
 
@@ -97,22 +98,44 @@ ready = true;
 await main();
 ```
 
-The ten-minute cap is not arbitrary. At a one-minute cap a single stuck application spends the
-Free store's entire daily quota in about five hours; at ten minutes it is a few dozen requests
-across a day. Nothing is waiting on a faster poll — role-assignment changes take minutes to
-propagate in both directions, so a restored grant is not a restored application either way.
+The ten-minute cap is not arbitrary, but it bounds **attempts, not requests**: what an attempt
+costs depends on how it fails. Measured on provider 2.6.0:
+
+- a refused read (403) costs about one request, because the provider backs its client off after
+  the 403;
+- an unreachable store costs none;
+- a failure after a complete read — a missing key, say — costs one request per key, as a success
+  does.
+
+Under a persistent 403 the default backoff starts attempts at about 0, 45, 90, 135, 190, 285, 460
+and 795 s, then one every ~615 s (the cap plus the startup timeout): about 140 attempts and about
+140 requests a day, 14% of a Free store's 1,000. A failure after a full read returns at once, so
+at the cap it settles to one attempt every ~600 s, about 144 a day, and costs about 144 × the
+number of keys: past the whole Free quota from 7 keys on, from one process. At a one-minute cap
+it would be over 1,100 attempts a day, past the quota even at one request each. Nothing is
+waiting on a faster poll — role-assignment changes take minutes to propagate in both directions,
+so a restored grant is not a restored application either way.
+
+The provider's own `Failed to load … Retrying in 5000 ms` warnings, about three per attempt, are
+its internal loop inside the startup timeout, not this retry schedule.
 
 ### Azure Functions — and anything else without a bootstrap phase
 
 The host builds a trigger's connection before user code runs, so trigger connections stay app
-settings. Everything else is hydrated on first use, awaited at the top of each function:
+settings. Everything else is hydrated on first use, awaited at the top of each function. Give every
+call the same options object, with a warn-level logger (why is below):
 
 ```ts
 import { hydrate } from '@actvalue/azure-app-config';
 
+const CONFIG = {
+  keys: KEYS,
+  logger: { log: (m: string) => console.warn(m), error: (m: string) => console.error(m) },
+};
+
 app.serviceBusQueue('Rollup', {
   handler: async (message, context) => {
-    await hydrate({ keys: KEYS });    // free after the first success
+    await hydrate(CONFIG);    // free after the first success
     await processMessage(message);
   },
 });
@@ -121,6 +144,14 @@ app.serviceBusQueue('Rollup', {
 Module-scope initialisation has to become lazy for this to work — a client constructed at import
 time reads the environment before hydration can fill it. That is a change in your application,
 not something a package can do for you.
+
+**Log the success line at warn level, or `host.json` may drop it.** The success line goes through
+`logger.log`, which with the default logger is `console.log`, at Information level. A typical
+`host.json` sets `logLevel.default` to `Warning` and raises only `Function` to `Information`, so a
+line from an attempt started outside an invocation — by an `appStart` hook — is filtered out. On a
+slot where only a health endpoint runs, that line is the only evidence of a load. The logger is per
+attempt (below), so whichever call starts an attempt is the one that logs it: that is why every
+call here passes `CONFIG`, a retry included.
 
 **An `app.hook.appStart()` hook is an early start, never the guarantee.** On the v4 Node worker,
 `startApp()` first loads every entry-point file — which runs all module-scope code — and only then
@@ -131,7 +162,7 @@ guarantee.
 
 ```ts
 app.hook.appStart(() => {
-  void hydrate({ keys: KEYS }).catch(() => {});   // an early start; handlers still await hydrate()
+  void hydrate(CONFIG).catch(() => {});   // an early start; handlers still await hydrate()
 });
 ```
 
@@ -147,11 +178,11 @@ import { ConfigFloorError, hydrate } from '@actvalue/azure-app-config';
 
 async function configured(): Promise<void> {
   try {
-    await hydrate({ keys: KEYS });
+    await hydrate(CONFIG);
   } catch (error) {
     if (!(error instanceof ConfigFloorError)) throw error;
     await new Promise(resolve => setTimeout(resolve, error.retryAfterMs));
-    await hydrate({ keys: KEYS });    // one more attempt; if it fails, the message is retried
+    await hydrate(CONFIG);    // one more attempt; if it fails, the message is retried
   }
 }
 ```
@@ -163,13 +194,21 @@ handler cannot wait out a floor longer than its invocation. Invocations
 that wake together and ask for the same keys share one attempt. The default floor,
 `DEFAULT_RETRY_FLOOR_MS`, is 30 s — well inside a function's timeout.
 
+**What the floor allows.** For `hydrate()` callers on message triggers the floor is the only
+limit: at most one attempt per floor window per process. At the 30 s default that is up to 2,880
+attempts a day per process while a failure persists and messages keep arriving — each costing
+what its kind of failure costs (above), so a 403 alone can pass a Free store's 1,000 from one
+process, and a failure after a full read costs a request per key. A Functions app on a Free store
+should weigh that against its instance count, and its key count, when it chooses `retryFloorMs`.
+
 **`hydrateWithBackoff` does not belong inside an invocation.** It returns only once the store
 answers, which can be long after the invocation's own timeout.
 
 **Report configuration health without spending quota.** A health endpoint that calls `hydrate()`
-may start a store attempt on every ping, and on a Free store pings during an outage spend the day's
-requests within about an hour. `hydrationStatus()` reads what `hydrate()` has done and never makes
-a request:
+may start a store attempt whenever the floor opens. Pings arriving on several instances then spend
+a Free store's daily requests during a persistent outage: within hours for a refused read, and
+faster for a failure after a full read, which costs one request per key. `hydrationStatus()` reads
+what `hydrate()` has done and never makes a request:
 
 ```ts
 import { hydrationStatus } from '@actvalue/azure-app-config';
@@ -192,7 +231,8 @@ app.http('health', {
 **The logger is per attempt, not per call.** An attempt logs through the `logger` of the call that
 started it; a call that joins it in flight, or is handed the memoised success, logs nothing through
 its own. So a per-invocation logger such as `InvocationContext` records the success line in
-whichever invocation happened to be first. Pass a process-level logger, or none, if that matters.
+whichever invocation happened to be first. Pass a process-level logger, such as `CONFIG`'s above,
+if that matters.
 
 ## Precedence: who wins when a variable is already set
 
@@ -210,6 +250,22 @@ deployed environment, true locally. Its default is "not deployed", read on every
 `func start`, a plain `node` run and a test runner never set. **Any other host — Container Apps,
 Kubernetes, a VM — injects nothing this reads, so pass `localOverridesWin: false` there**, or the
 local environment beats the store.
+
+The success line ends with which side won and why, on every successful attempt, whether or not
+anything was kept — so a missing signal shows up in the first log line, not as a stale value
+winning:
+
+```
+Configuration loaded from App Configuration, label prod: MONGO_URL, HTTP_PORT (store wins: WEBSITE_INSTANCE_ID present)
+Configuration loaded from App Configuration, label prod: MONGO_URL, HTTP_PORT (local wins: WEBSITE_INSTANCE_ID absent)
+Configuration loaded from App Configuration, label prod: MONGO_URL, HTTP_PORT (store wins: localOverridesWin option false)
+Configuration loaded from App Configuration, label prod: MONGO_URL, HTTP_PORT (local wins: localOverridesWin option true)
+```
+
+With the option passed, the line states the decision it produced: a JavaScript caller passing the
+string `"false"`, which is truthy, gets local-wins and `localOverridesWin option true`. `null` is
+treated as not passed. The line names variables, never values. When something was kept, a second
+line, `Kept from the local environment: …`, names those.
 
 `NODE_ENV` plays no part. In a Functions app it is an ordinary per-slot app setting that often
 means something else, and a staging slot carrying `development` would let leftover settings beat

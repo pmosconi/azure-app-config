@@ -57,12 +57,18 @@ ready = true;
 
 **Azure Functions**, and anything else with no bootstrap phase. The host builds a trigger's
 connection before user code runs, so trigger connections stay app settings; everything else is
-hydrated on first use and awaited at the top of each function.
+hydrated on first use and awaited at the top of each function. Give every call the same options
+object, with a warn-level logger (why is below):
 
 ```ts
+const CONFIG = {
+  keys: KEYS,
+  logger: { log: (m: string) => console.warn(m), error: (m: string) => console.error(m) },
+};
+
 app.serviceBusQueue('Rollup', {
   handler: async (message, context) => {
-    await hydrate({ keys: KEYS });        // free after the first success
+    await hydrate(CONFIG);                // free after the first success
     await processMessage(message);
   },
 });
@@ -71,7 +77,15 @@ app.serviceBusQueue('Rollup', {
 Module-scope initialisation has to become lazy for this to work: a client constructed at import
 time reads the environment before hydration can fill it. That is a change in your application.
 
-### Azure Functions: four things the handler shape needs
+### Azure Functions: what the handler shape needs
+
+**Log the success line at warn level, or `host.json` may drop it.** The success line goes through
+`logger.log` — `console.log` by default, at Information level. A typical `host.json` sets
+`logLevel.default` to `Warning` and raises only `Function` to `Information`, so the line from an
+attempt started outside an invocation, by an `appStart` hook, is filtered out; on a slot where only
+a health endpoint runs, it is the only evidence of a load. The logger is per attempt, so whichever
+call starts an attempt is the one that logs it: that is why every call below passes `CONFIG`, a
+retry included.
 
 **An `app.hook.appStart()` hook is an early start, never the guarantee.** On the v4 Node worker,
 `startApp()` loads every entry-point file first — running all module-scope code — then runs the
@@ -80,7 +94,7 @@ import and blocks worker initialisation, so never throw from one and never await
 
 ```ts
 app.hook.appStart(() => {
-  void hydrate({ keys: KEYS }).catch(() => {});   // an early start; handlers still await hydrate()
+  void hydrate(CONFIG).catch(() => {});   // an early start; handlers still await hydrate()
 });
 ```
 
@@ -95,11 +109,11 @@ import { ConfigFloorError, hydrate } from '@actvalue/azure-app-config';
 
 async function configured(): Promise<void> {
   try {
-    await hydrate({ keys: KEYS });
+    await hydrate(CONFIG);
   } catch (error) {
     if (!(error instanceof ConfigFloorError)) throw error;
     await new Promise(resolve => setTimeout(resolve, error.retryAfterMs));
-    await hydrate({ keys: KEYS });    // one more attempt; if it fails, the message is retried
+    await hydrate(CONFIG);    // one more attempt; if it fails, the message is retried
   }
 }
 ```
@@ -108,6 +122,14 @@ Waiting exactly `retryAfterMs` is enough: it is the time until the floor opens r
 50 ms margin, so a timer that fires a millisecond early still lands outside the floor. The pattern
 assumes `retryFloorMs` sits well inside the invocation's timeout, as the 30 s default does; a
 handler cannot wait out a floor longer than its invocation.
+
+**What the floor allows.** For `hydrate()` callers on message triggers the floor is the only
+limit: at most one attempt per floor window per process. At the 30 s default that is up to 2,880
+attempts a day per process while a failure persists and messages keep arriving — each costing what
+its kind of failure costs (see `hydrateWithBackoff` below), so a 403 alone can pass a Free store's
+1,000 from one process, and a failure after a full read costs a request per key. A Functions app
+on a Free store should weigh that against its instance count, and its key count, when it chooses
+`retryFloorMs`.
 
 **`hydrateWithBackoff` does not belong inside an invocation.** It returns only once the store
 answers, which can be long after the invocation's timeout.
@@ -182,6 +204,20 @@ Service and Azure Functions inject on every instance and `func start`, `node` an
 set. **Other hosts — Container Apps, Kubernetes, a VM — inject nothing this reads: pass
 `localOverridesWin: false` there.**
 
+The success line ends with which side won and why, whether or not anything was kept, so a missing
+signal shows in the first log line rather than as a stale value winning. It names variables, never
+values; a `Kept from the local environment: …` line follows when something was kept.
+
+```
+Configuration loaded from App Configuration, label prod: MONGO_URL, HTTP_PORT (store wins: WEBSITE_INSTANCE_ID present)
+Configuration loaded from App Configuration, label prod: MONGO_URL, HTTP_PORT (local wins: WEBSITE_INSTANCE_ID absent)
+Configuration loaded from App Configuration, label prod: MONGO_URL, HTTP_PORT (store wins: localOverridesWin option false)
+Configuration loaded from App Configuration, label prod: MONGO_URL, HTTP_PORT (local wins: localOverridesWin option true)
+```
+
+With the option passed, the line states the decision it produced: the string `"false"`, which is
+truthy, gives local-wins and `localOverridesWin option true`. `null` is treated as not passed.
+
 `NODE_ENV` plays no part: in a Functions app it is a per-slot setting that often means something
 else. Nor is the label derived from it — images bake `ENV NODE_ENV=production`, so a staging
 container would otherwise read the production label.
@@ -232,11 +268,20 @@ that is longer. `initialMs` and `maxMs` must be finite and above 0. Waits longer
 honours (about 24.8 days) are slept in steps. **Long-lived processes only**, never inside a
 function invocation.
 
-The ten-minute cap is not arbitrary: at a one-minute cap a single stuck application spends a Free
-store's entire daily quota in about five hours. Nothing waits on a faster poll, because
-role-assignment changes take minutes to propagate in both directions. `hydrate`'s retry floor
-still applies: a delay shorter than `retryFloorMs` meets a `ConfigFloorError`, and the loop waits
-for the floor to open rather than counting it as a failure.
+The ten-minute cap is not arbitrary, but it bounds **attempts, not requests**: what an attempt
+costs depends on how it fails. Measured on provider 2.6.0, a refused read (403) costs about one
+request, because the provider backs its client off after the 403; an unreachable store costs none;
+a failure after a complete read — a missing key, say — costs one per key, as a success does. Under
+a persistent 403 attempts start at about 0, 45, 90, 135, 190, 285, 460 and 795 s, then one every
+~615 s: about 140 requests a day, 14% of a Free store's 1,000. A failure after a full read settles
+to one attempt every ~600 s, about 144 a day, costing about 144 × the number of keys: past the
+whole Free quota from 7 keys on, from one process. At a one-minute cap it would be over 1,100
+attempts a day, past the quota even at one request each. Nothing waits on a faster poll, because
+role-assignment changes take minutes to propagate in both directions. `hydrate`'s retry floor still applies: a delay shorter than `retryFloorMs` meets a
+`ConfigFloorError`, and the loop waits for the floor to open rather than counting it as a failure.
+
+The provider's own `Failed to load … Retrying in 5000 ms` warnings, about three per attempt, are
+its internal loop inside the startup timeout, not this retry schedule.
 
 ### `hydrationStatus(keys, label?): HydrationStatus`
 

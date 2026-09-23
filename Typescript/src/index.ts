@@ -532,12 +532,33 @@ function isLocal(): boolean {
   return !process.env.WEBSITE_INSTANCE_ID;
 }
 
+/**
+ * Which side wins this attempt, and why, for the success line. Stated whether or not anything was
+ * kept: on a host where the platform signal is missing, the first sign would otherwise be a stale
+ * value winning, and a consumer with no local settings left could never confirm the signal at all.
+ *
+ * Decided exactly as `options.localOverridesWin ?? isLocal()` always was, and the reason is built
+ * from that decision, never from the raw option: a JavaScript caller passing the string `"false"`
+ * gets local-wins, because the string is truthy, and the line must say `true`, not echo `false`
+ * against the decision. `null` falls through to the platform signal, as `??` does, and the reason
+ * names the signal. An empty `WEBSITE_INSTANCE_ID` counts as absent, as {@link isLocal} reads it.
+ * Never a value.
+ */
+function precedence(option: unknown): { localWins: boolean; reason: string } {
+  if (option !== undefined && option !== null) {
+    const localWins = Boolean(option);
+    return { localWins, reason: `localOverridesWin option ${String(localWins)}` };
+  }
+  const localWins = isLocal();
+  return { localWins, reason: `WEBSITE_INSTANCE_ID ${localWins ? 'absent' : 'present'}` };
+}
+
 async function attemptHydration(plan: Plan, options: HydrateOptions): Promise<HydrationResult> {
   const { entries, label } = plan;
   // The logger of the call that started this attempt. Callers that join it log nothing.
   const logger = options.logger ?? console;
   const config = await loadStore(entries.map(([key]) => key), label, options);
-  const localWins = options.localOverridesWin ?? isLocal();
+  const { localWins, reason } = precedence(options.localOverridesWin);
 
   const unusable: string[] = [];
   const writes: [string, string][] = [];
@@ -585,8 +606,10 @@ async function attemptHydration(plan: Plan, options: HydrateOptions): Promise<Hy
     applied.push(variable);
   }
 
+  // One line, names only, never a value. The 0.2.0 prefix is unchanged and the mode follows the
+  // list, stated whether or not anything was kept.
   logger.log(
-    `Configuration loaded from App Configuration, label ${label}: ${applied.join(', ') || 'nothing'}`
+    `Configuration loaded from App Configuration, label ${label}: ${applied.join(', ') || 'nothing'} (${localWins ? 'local' : 'store'} wins: ${reason})`
   );
   if (kept.length) {
     logger.log(`Kept from the local environment: ${kept.join(', ')}`);

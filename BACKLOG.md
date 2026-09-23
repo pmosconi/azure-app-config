@@ -97,6 +97,56 @@ Line references are to `Typescript/src/index.ts` at `93f2724`.
   - that `hydrateWithBackoff` doesn't belong inside an invocation;
   - how a health endpoint can report config status without spending quota (see item 4).
 
+## Found by the second consumer, on `0.2.0`
+
+The second consumer, a container web app on App Service, converted to `0.2.0`, and so did the first consumer, with its workarounds deleted. Neither needed a library change. These items are for `0.2.x` or `1.0.0`.
+
+### 8. The quota figures in the docs are wrong
+
+**Shipped in 0.2.1.** The docs now say the cap bounds attempts, not requests: about 140 requests a day under a persistent 403, about 144 × keys under a failure after a full read, and up to 2,880 attempts a day per process from the floor alone for `hydrate()` callers. The README says what the provider's `Retrying in 5000 ms` warnings are.
+
+**Priority: low.**
+
+- **Now:** `README.md` (about line 101) and `CLAUDE.md` (about line 135) say that at the 600 s cap a persistent failure costs "a few dozen requests a day".
+- **Measured on provider 2.6.0, against a local fake store:**
+  - A refused read (403) costs **1 request per attempt**. After the 403 the provider puts its only client into a 30 s backoff, so its later passes inside the same attempt send nothing.
+  - An unreachable store costs **0**.
+  - A success costs one request per key.
+  - With the default backoff, attempts start at about 0, 45, 90, 135, 190, 285, 460 and 795 s, then every ~615 s. That is about **140 attempts a day**, so about 140 requests a day under a persistent 403, or 14% of the Free tier. The 600 s cap is still right; only the figure is wrong.
+- **Also worth a README sentence:** the provider logs its own `Failed to load … Retrying in 5000 ms` warning three times per attempt. That is its internal loop inside the startup timeout, not the retry schedule.
+
+### 9. The precedence mode is not logged
+
+**Shipped in 0.2.1.** The success line ends with which side wins and why, kept or not, for example `…: A, B (store wins: WEBSITE_INSTANCE_ID present)` or `(local wins: localOverridesWin option true)`. The `0.2.0` prefix is unchanged.
+
+**Priority: medium.**
+
+- **Now:** the success line names the variables taken from the store. A `Kept from the local environment` line appears only when something was kept.
+- **Problem:** item 1 made precedence depend on a platform signal. On a host where that signal is missing, nothing is logged until a variable is set locally, so the first sign is a stale value winning. A consumer that has removed its app settings can never confirm the signal from the logs.
+- **Proposal:** put the mode in the success line, for example `… label prod (store wins: deployed)` / `(local wins: no platform signal)`, whether or not anything was kept.
+- **Consumer workaround:** the container consumer logs its own precedence line at startup, which repeats the `!WEBSITE_INSTANCE_ID` rule.
+
+### 10. `hydrateWithBackoff` gives up on a store-side input error
+
+**Decided in 0.2.1: not done.** `hydrateWithBackoff` still rethrows every `ConfigInputError`, for two reasons. First, `reachedStore` is `answered > 0` for a response of any status, and the input classification covers a `TypeError` or `RangeError` anywhere in the chain, so it does not prove a store-side defect, and a retry could loop for ever on a defect no store fix heals. Second, it would break the `0.2.0` contract: `ConfigInputError` means "don't wait" wherever it is caught, and `onError` never receives one, so a consumer whose `onError` treats it as fatal would break. Unreachable on provider 2.6.0; revisit if a provider version can produce it.
+
+**Priority: low (defensive on provider 2.6.0).**
+
+- **Now:** `hydrateWithBackoff` rethrows every `ConfigInputError`, including one with `reachedStore: true`.
+- **Problem:** a store-side input error is fixed in the store. A long-lived process that stopped retrying needs a restart to pick up the fix, while one that kept retrying would heal itself, and the floor already limits what retrying costs.
+- **Proposal:** keep retrying when `reachedStore` is true, or document why not.
+- **Consumer workaround:** none needed on 2.6.0, where this error cannot occur.
+
+### 11. Functions: the success line is at Information level, outside an invocation
+
+**Shipped in 0.2.1.** The README's Functions section recommends a logger whose `log` writes at warn level, with an example.
+
+**Priority: medium (docs).**
+
+- **Problem:** a typical `host.json` sets `logLevel.default` to `Warning` and raises only `Function` to `Information`. The success line from an attempt that an `appStart` hook started is a `console.log` outside any invocation, so it is filtered out. On a slot where only a health endpoint runs, that line is the only evidence of a load.
+- **Proposal:** a README note in the Functions section: pass a `logger` whose `log` writes at warn level, or raise the relevant category in `host.json`.
+- **Consumer workaround:** the first consumer passes a logger that maps `log` to `console.warn`.
+
 ## Already open
 
 - ESM/CJS dual state (CLAUDE.md, **Status**, deferred to `1.0.0`). The first consumer is CJS-only and adds nothing new.

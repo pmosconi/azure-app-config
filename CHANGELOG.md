@@ -4,6 +4,69 @@ Changes to `@actvalue/azure-app-config`. Until `1.0.0` a minor version may break
 release says what, and which consumer workarounds it lets you delete. The Python half, when it is
 written, matches every behaviour listed here (see the parity rule in `CLAUDE.md`).
 
+## 0.2.1 - released 2026-09-23
+
+What the second consumer found on `0.2.0`: a container web app on App Service. `BACKLOG.md`
+items 8–11 give the reasoning.
+
+**No code change is required.** A patch release: no API is added, removed or changed. Code that
+passes a `logger`, reads `hydrationStatus().nextAttemptAt`, waits on
+`ConfigFloorError.retryAfterMs` or catches `ConfigInputError` around `hydrateWithBackoff` works as
+it did. The only visible change is text appended to the success line. Its `0.2.0` prefix,
+`Configuration loaded from App Configuration, label <label>: <variables>`, is unchanged, so only a
+log matcher anchored at the **end** of that line is affected.
+
+### Changed
+
+- **The success line ends with the precedence mode, and why.** It says which side wins, on every
+  successful attempt, whether or not anything was kept, after the variable list. It is still one
+  line through `logger.log`, once per successful attempt, and names variables, never values. The
+  `Kept from the local environment: …` line is unchanged. The four forms:
+
+  ```
+  Configuration loaded from App Configuration, label prod: A, B (store wins: WEBSITE_INSTANCE_ID present)
+  Configuration loaded from App Configuration, label prod: A, B (local wins: WEBSITE_INSTANCE_ID absent)
+  Configuration loaded from App Configuration, label prod: A, B (store wins: localOverridesWin option false)
+  Configuration loaded from App Configuration, label prod: A, B (local wins: localOverridesWin option true)
+  ```
+
+  The reason states the decision precedence actually made, which is unchanged: an empty
+  `WEBSITE_INSTANCE_ID` counts as absent; a non-boolean option goes by truthiness, so the string
+  `"false"` gives `(local wins: localOverridesWin option true)`; `null` is treated as not passed
+  and the reason names the signal. Before, a host missing the signal showed nothing until a stale
+  local value won, and a consumer with no local settings left could never confirm the signal from
+  its logs.
+- `hydrateWithBackoff` still rethrows every `ConfigInputError`, including one with
+  `reachedStore: true`: that flag does not prove a store-side defect, and retrying would break the
+  "don't wait" contract (`BACKLOG.md` item 10, decided not done).
+
+### Documentation
+
+- **Corrected quota figures. The backoff cap bounds attempts, not requests.** What an attempt costs
+  depends on how it fails, measured on provider 2.6.0: a refused read (403) about one request,
+  because the provider backs its client off after the 403; an unreachable store none; a failure
+  after a complete read, such as a missing key, one per key, as a success does. Under a persistent
+  403 attempts start at about 0, 45, 90, 135, 190, 285, 460 and 795 s, then every ~615 s: about
+  140 requests a day, not "a few dozen". Under a persistent failure after a full read, about 144
+  attempts a day at the cap, so about 144 × keys requests: past a Free store's 1,000 from 7 keys.
+  The 600 s cap and its reasoning stand; no default changed.
+- **What the retry floor allows.** For `hydrate()` callers on message triggers the floor is the
+  only limit: at most one attempt per floor window per process, up to 2,880 a day per process at
+  the 30 s default. A Functions app on a Free store should weigh that against its instance count
+  when it chooses `retryFloorMs`.
+- The provider's own `Failed to load … Retrying in 5000 ms` warnings, about three per attempt, are
+  its internal loop inside the startup timeout, not the retry schedule.
+- Azure Functions: a typical `host.json` (`logLevel.default: "Warning"`) filters the
+  Information-level success line from an attempt started outside an invocation, by an `appStart`
+  hook. The README's Functions examples now share one options object whose logger writes at warn
+  level, `{ log: (m) => console.warn(m), error: (m) => console.error(m) }`, passed to every call,
+  a retry included.
+
+### Workarounds to delete after upgrading
+
+- [ ] A precedence line the consumer logs itself at startup, repeating the
+      `!WEBSITE_INSTANCE_ID` rule. The success line now carries the mode and the reason.
+
 ## 0.2.0 - released 2026-09-23
 
 Everything the first consumer found while converting to `0.1.0`: an Azure Functions app with eight

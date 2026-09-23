@@ -48,6 +48,13 @@ export interface HydrateOptions {
    * Inside the floor, `hydrate` rejects with a `ConfigFloorError` without touching the store. Must
    * be a finite number, 0 or more — NaN would switch the floor off — or `hydrate` rejects with
    * `ConfigInputError`. Large values are allowed.
+   *
+   * For `hydrate()` callers on message triggers this is the only limit: at most one attempt per
+   * floor window per process, so up to 2,880 a day per process at the default while a failure
+   * persists and messages keep arriving. Each costs what its failure costs (see
+   * {@link BackoffOptions.maxMs}), so a 403 alone can pass a Free store's 1,000 from one process.
+   * A Functions app on a Free store should weigh that against its instance count, and its key
+   * count, when it chooses this value.
    */
   retryFloorMs?: number;
   /**
@@ -58,6 +65,11 @@ export interface HydrateOptions {
    * and Azure Functions inject on every instance and which `func start`, a plain `node` run and a
    * test runner never set. Any other host — Container Apps, Kubernetes, a VM — sets none of that,
    * so it must pass `false` explicitly, or a leftover setting beats the store without a warning.
+   *
+   * The success line ends with which side won and why, whether or not anything was kept:
+   * `(store wins: WEBSITE_INSTANCE_ID present)`, `(local wins: WEBSITE_INSTANCE_ID absent)`, or
+   * `(… wins: localOverridesWin option true|false)` when this option is passed, stating the
+   * decision it produced.
    *
    * Never derived from `NODE_ENV`, which a Functions slot may set to anything.
    */
@@ -118,8 +130,14 @@ export interface BackoffOptions {
   /**
    * Cap on the delay. Default 600 s.
    *
-   * At a 60 s cap one stuck application spends a Free store's entire daily quota in about five
-   * hours; at 600 s it is a few dozen requests a day. Nothing is waiting on a faster poll —
+   * The cap bounds attempts, not requests: what an attempt costs depends on how it fails.
+   * Measured on provider 2.6.0, a refused read (403) costs about one request, because the provider
+   * backs its client off after the 403; an unreachable store costs none; a failure after a complete
+   * read — a missing key — costs one per key, as a success does. At the 600 s cap a persistent 403
+   * settles to an attempt every ~615 s (the cap plus the startup timeout), about 140 requests a
+   * day; a persistent failure after a full read to one every ~600 s, about 144 × the number of
+   * keys a day, past a Free store's 1,000 from 7 keys on. At a 60 s cap it would be over 1,100
+   * attempts a day, past the quota even at one request each. Nothing is waiting on a faster poll —
    * role-assignment changes take minutes to propagate in both directions, so a restored grant is
    * not a restored application either way. A finite number above 0.
    */

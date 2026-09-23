@@ -199,6 +199,172 @@ describe('precedence', () => {
   });
 });
 
+/**
+ * The success line states the precedence mode and why, whether or not anything was kept. Precedence
+ * hangs on a platform signal, so on a host where it is missing the first sign used to be a stale
+ * value winning — and a consumer with no local settings left could never confirm it from the logs.
+ * The 0.2.0 prefix is unchanged: the mode follows the variable list.
+ */
+describe('the success line states which side wins, and why', () => {
+  const ALL = 'MONGO_URL, SERVICE_BUS_CONNECTION, HTTP_PORT';
+  const LINE = `Configuration loaded from App Configuration, label prod: ${ALL}`;
+
+  function logger() {
+    return { log: vi.fn(), error: vi.fn() };
+  }
+
+  it('says the store wins because WEBSITE_INSTANCE_ID is present', async () => {
+    deployed();
+    const log = logger();
+    loadMock.mockResolvedValue(fakeStore() as never);
+
+    await hydrate({ keys: KEYS, logger: log });
+
+    expect(log.log.mock.calls).toEqual([[`${LINE} (store wins: WEBSITE_INSTANCE_ID present)`]]);
+  });
+
+  it('says the local environment wins because WEBSITE_INSTANCE_ID is absent — with nothing kept', async () => {
+    const log = logger();
+    loadMock.mockResolvedValue(fakeStore() as never);
+
+    const result = await hydrate({ keys: KEYS, logger: log });
+
+    // Nothing was set locally, so nothing was kept: the mode is stated all the same.
+    expect(result.kept).toEqual([]);
+    expect(log.log.mock.calls).toEqual([[`${LINE} (local wins: WEBSITE_INSTANCE_ID absent)`]]);
+  });
+
+  it('counts an empty WEBSITE_INSTANCE_ID as absent, as precedence does', async () => {
+    process.env.WEBSITE_INSTANCE_ID = '';
+    const log = logger();
+    loadMock.mockResolvedValue(fakeStore() as never);
+
+    await hydrate({ keys: KEYS, logger: log });
+
+    expect(log.log.mock.calls).toEqual([[`${LINE} (local wins: WEBSITE_INSTANCE_ID absent)`]]);
+  });
+
+  it('names the option, not the signal, when localOverridesWin: true is passed', async () => {
+    deployed();
+    const log = logger();
+    loadMock.mockResolvedValue(fakeStore() as never);
+
+    await hydrate({ keys: KEYS, localOverridesWin: true, logger: log });
+
+    expect(log.log.mock.calls).toEqual([[`${LINE} (local wins: localOverridesWin option true)`]]);
+  });
+
+  it('names the option, not the signal, when localOverridesWin: false is passed', async () => {
+    const log = logger();
+    loadMock.mockResolvedValue(fakeStore() as never);
+
+    await hydrate({ keys: KEYS, localOverridesWin: false, logger: log });
+
+    expect(log.log.mock.calls).toEqual([[`${LINE} (store wins: localOverridesWin option false)`]]);
+  });
+
+  it('states the decision, not the raw value, for the string "false" — which is truthy, so local wins', async () => {
+    // A JavaScript caller, or one reading the option from an environment variable, can pass a
+    // string. Precedence has always gone by truthiness; the line must agree with what happened.
+    deployed();
+    process.env.HTTP_PORT = '9000';
+    const log = logger();
+    loadMock.mockResolvedValue(fakeStore() as never);
+
+    const result = await hydrate({ keys: KEYS, localOverridesWin: 'false' as unknown as boolean, logger: log });
+
+    expect(result.kept).toEqual(['HTTP_PORT']);
+    expect(process.env.HTTP_PORT).toBe('9000');
+    expect(log.log.mock.calls[0]![0]).toBe(
+      'Configuration loaded from App Configuration, label prod: MONGO_URL, SERVICE_BUS_CONNECTION (local wins: localOverridesWin option true)'
+    );
+  });
+
+  it('treats null as ?? does — the platform signal decides, and the line names the signal', async () => {
+    const log = logger();
+    loadMock.mockResolvedValue(fakeStore() as never);
+    process.env.HTTP_PORT = '9000';
+
+    deployed();
+    const remote = await hydrate({ keys: KEYS, localOverridesWin: null as unknown as boolean, logger: log });
+    resetHydration();
+    delete process.env.WEBSITE_INSTANCE_ID;
+    for (const variable of Object.values(KEYS)) delete process.env[variable];
+    process.env.HTTP_PORT = '9000';
+    const local = await hydrate({ keys: KEYS, localOverridesWin: null as unknown as boolean, logger: log });
+
+    expect(remote.kept).toEqual([]);
+    expect(local.kept).toEqual(['HTTP_PORT']);
+    expect(log.log.mock.calls).toEqual([
+      [`${LINE} (store wins: WEBSITE_INSTANCE_ID present)`],
+      [
+        'Configuration loaded from App Configuration, label prod: MONGO_URL, SERVICE_BUS_CONNECTION (local wins: WEBSITE_INSTANCE_ID absent)',
+      ],
+      ['Kept from the local environment: HTTP_PORT'],
+    ]);
+  });
+
+  it('keeps the 0.2.0 prefix intact, so a matcher on it still matches', async () => {
+    deployed();
+    const log = logger();
+    loadMock.mockResolvedValue(fakeStore() as never);
+
+    await hydrate({ keys: KEYS, logger: log });
+
+    expect(log.log.mock.calls[0]![0]).toMatch(/^Configuration loaded from App Configuration, label prod: MONGO_URL/);
+  });
+
+  it('leaves the kept line as it was, and never logs a value', async () => {
+    process.env.HTTP_PORT = '9000';
+    process.env.MONGO_URL = 'mongodb://127.0.0.1:27017/local';
+    const log = logger();
+    loadMock.mockResolvedValue(fakeStore() as never);
+
+    await hydrate({ keys: KEYS, logger: log });
+
+    expect(log.log.mock.calls).toEqual([
+      [
+        'Configuration loaded from App Configuration, label prod: SERVICE_BUS_CONNECTION (local wins: WEBSITE_INSTANCE_ID absent)',
+      ],
+      ['Kept from the local environment: MONGO_URL, HTTP_PORT'],
+    ]);
+    const logged = log.log.mock.calls.flat().join('\n');
+    for (const value of [...Object.values(VALUES), '9000', 'mongodb://127.0.0.1:27017/local']) {
+      expect(logged).not.toContain(value);
+    }
+    expect(log.error).not.toHaveBeenCalled();
+  });
+
+  it('logs once per successful attempt, not per call', async () => {
+    deployed();
+    const log = logger();
+    loadMock.mockResolvedValue(fakeStore() as never);
+
+    await hydrate({ keys: KEYS, logger: log });
+    await hydrate({ keys: KEYS, logger: log });
+
+    expect(log.log).toHaveBeenCalledTimes(1);
+  });
+
+  it('reaches a warn-level logger unchanged — the Functions shape, which passes console.warn itself', async () => {
+    // A Functions consumer passes { log: console.warn, error: console.error } so the line survives
+    // a host.json that filters Information outside an invocation. It must keep working as passed.
+    deployed();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const plain = vi.spyOn(console, 'log').mockImplementation(() => {});
+    loadMock.mockResolvedValue(fakeStore() as never);
+    try {
+      await hydrate({ keys: KEYS, logger: { log: console.warn, error: console.error } });
+
+      expect(warn.mock.calls).toEqual([[`${LINE} (store wins: WEBSITE_INSTANCE_ID present)`]]);
+      expect(plain).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+      plain.mockRestore();
+    }
+  });
+});
+
 describe('missing keys', () => {
   it('names every missing key at once, not the first', async () => {
     loadMock.mockResolvedValue(fakeStore({ 'shared:mongoUrl': VALUES['shared:mongoUrl']! }) as never);
