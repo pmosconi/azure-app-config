@@ -1,6 +1,6 @@
 {
   "name": "@actvalue/azure-app-config",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Hydrate process.env from Azure App Configuration, with the failure handling that platform actually needs",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -18,8 +18,9 @@
     "test:watch": "vitest",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
-    "prepublishOnly": "npm run build",
-    "test:integration": "vitest run --config vitest.integration.config.mts"
+    "prepublishOnly": "npm run build && node scripts/check-dist.mjs",
+    "test:integration": "vitest run --config vitest.integration.config.mts",
+    "check:dist": "node scripts/check-dist.mjs"
   },
   "keywords": [
     "azure",
@@ -45,6 +46,7 @@
   },
   "devDependencies": {
     "@azure/core-rest-pipeline": "^1.25.0",
+    "@azure/functions": "^4.16.5",
     "@types/node": "^24.x",
     "@typescript-eslint/eslint-plugin": "^8.68.0",
     "@typescript-eslint/parser": "^8.68.0",

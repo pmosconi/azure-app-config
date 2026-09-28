@@ -2,9 +2,9 @@
  * Invariant 2 — memoise success, never failure, and rate-limit retrying.
  *
  * Caching a rejected promise makes the first attempt the only one. Not rate-limiting means every
- * queue trigger re-attempts on every invocation, which on the Free SKU (1,000 requests a day,
- * then HTTP 429 to every reader until midnight UTC) spends the quota in minutes and starves
- * every other consumer of the store.
+ * queue trigger re-attempts on every invocation, which on a capped tier (on Free, a meter
+ * observed nearer 250–400 requests a day, then HTTP 429 to every reader until it resets) spends
+ * the quota in minutes and starves every other consumer of the store.
  */
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 import { load } from '@azure/app-configuration-provider';

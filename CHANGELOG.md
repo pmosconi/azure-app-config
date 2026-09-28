@@ -4,6 +4,127 @@ Changes to `@actvalue/azure-app-config`. Until `1.0.0` a minor version may break
 release says what, and which consumer workarounds it lets you delete. The Python half, when it is
 written, matches every behaviour listed here (see the parity rule in `CLAUDE.md`).
 
+## 0.3.0 - unreleased
+
+What the third and fourth consumers found on `0.2.1` — two Functions apps with HTTP triggers only,
+which answer a failed load with an immediate 503 — plus the two items deferred to `1.0.0`, now
+settled. `BACKLOG.md` items 12–19 and "Already open" give the reasoning. This is the candidate for
+the frozen TypeScript API: `1.0.0` adds the Python half and republishes this one without a
+behaviour change. Nothing is removed and no signature changes; three exports are added.
+
+### What a consumer changes
+
+- [ ] **A fail-fast HTTP gate → `gated()`.** Delete the gate at the top of each handler — the
+      `ConfigFloorError` branch, the `Retry-After` arithmetic, the `lastLogged` identity dedupe and
+      its `Configuration load failed` line — and register `handler: gated(CONFIG, handler)`. The
+      response is the same: 503, `Service Unavailable`, `Retry-After` in whole seconds (at least
+      1), none for a `ConfigInputError`.
+- [ ] **A hardcoded `FLOOR_MARGIN_MS = 50`**, and a `Retry-After` computed from
+      `hydrationStatus(keys).nextAttemptAt`. Use `retryAfterMs(error)`.
+- [ ] **A message trigger's fresh-failure wait** computed from `nextAttemptAt` plus 50, with a
+      `DEFAULT_RETRY_FLOOR_MS + 50` fallback, and its own warn line. Rethrow a
+      `ConfigInputError`, otherwise wait `retryAfterMs(error) ?? 0` — it covers the floor
+      rejection and the fresh failure alike, and `undefined` there means the floor is already open
+      — and delete the line: `hydrate()` logs the failure.
+- [ ] **Any failure line a consumer logs itself after `hydrate()` rejects is now a duplicate**
+      until it is deleted. `hydrate()` logs `Configuration load failed: <message>` once per
+      attempt, the text the fail-fast consumers used, so deleting theirs changes no log.
+- [ ] **A logger with no `error` method now receives failure lines through `log`**, and **with
+      the default logger (`console`) each failed attempt now prints a `console.error` line.**
+      Consumer tests that spy on `console.error` or `logger.log` and assert zero calls, or exact
+      counts, on failure paths need updating.
+- [ ] **Tests that re-import the package for fresh state** — `vi.resetModules()` before a dynamic
+      import, `jest.resetModules()`, `jest.isolateModules(() => require(...))` — no longer get it:
+      the state is shared across module instances, so memo and floor leak from test to test.
+      Call `resetHydration()` in `beforeEach`. Separate test files stay isolated.
+- `hydrateWithBackoff` users change nothing: a custom `onError` still produces the only line per
+  failure, and the default still logs its own `Configuration load failed, retrying in …` line.
+
+### Added
+
+- **`retryAfterMs(error): number | undefined`** — how long to wait after any rejection from
+  `hydrate()`. A `ConfigFloorError`: its `retryAfterMs`. A `ConfigInputError`, whether or not it
+  reached the store: `undefined`, since waiting won't fix it. Anything else: the time until the
+  armed retry floor opens, measured with the `retryFloorMs` of the attempt that armed it (as
+  `hydrationStatus().nextAttemptAt` is), rounded up, plus the same 50 ms margin — `undefined` if
+  the floor is already open, meaning retry now. So `undefined` is "don't retry" for a
+  `ConfigInputError` and "retry now" for anything else. Makes no request.
+- **`gated(options, handler)`** — wraps an HTTP handler. Each call awaits `hydrate(options)`,
+  then calls the handler with the original arguments and returns its result; the handler's own
+  errors propagate untouched. On any rejection it returns `{ status: 503, body: 'Service
+  Unavailable' }`, with `headers: { 'Retry-After': '<seconds>' }` —
+  `Math.max(1, Math.ceil(retryAfterMs(error) / 1000))` — whenever `retryAfterMs` gives a wait. It
+  never rejects because of configuration and logs nothing itself.
+- **`ConfigUnavailableResponse`**, its return type: `{ status: 503; body: string; headers?:
+  Record<string, string> }`. Structural, and assignable to an Azure Functions `HttpResponseInit`,
+  so the package depends on `@azure/functions` neither at run time nor in its types.
+
+### Changed
+
+- **`hydrate()` logs a failed attempt, once.** One line, through the `error` method — `log` if the
+  logger has none — of the logger of the call that started the attempt:
+
+  ```
+  Configuration load failed: <the error's message>
+  ```
+
+  The message names the store, the label, the keys or the cause, never a value. Callers that join
+  the attempt, memo hits and `ConfigFloorError` rejections log nothing. A call rejected before
+  any request — no endpoint, no label, a filter character, a timing option that is not a usable
+  number, or an input error the provider raises before its first request — is logged the same way
+  the first time its message is seen, and not again until `resetHydration()`. A logger that
+  throws, or returns a promise that rejects, changes nothing: the call rejects with the error it
+  would have, and nothing goes unhandled — `hydrate(undefined)` still returns a rejected promise.
+  `hydrateWithBackoff`'s attempts are reported by its `onError` alone, and the `ConfigInputError`
+  it rethrows is not logged.
+- **`hydrateWithBackoff`'s default `onError` survives a broken logger.** Its line is unchanged, but
+  a logger that throws no longer ends the retry loop with the logger's error, and an async logger
+  that rejects no longer leaves an unhandled rejection. A custom `onError` that throws still ends
+  the loop, as before: it is the caller's code.
+- **The ESM and the CJS build share one state.** It lives on `globalThis` under a symbol that
+  carries the exact package version, so a process reaching both builds has one memo and one
+  retry floor — before, it had two, spending the quota invariant twice — and `resetHydration()`
+  from either clears both. Two different versions in one process keep separate state: each
+  version has its own floor. `resetHydration()` also clears the set of pre-request errors already
+  logged.
+- **`instanceof` works across builds.** `ConfigInputError`, `ConfigLoadError` and
+  `ConfigFloorError` carry a brand that `instanceof` checks. The error classes' brands carry no
+  version, so `instanceof` matches an instance from either build of any version of the package;
+  the state is shared only by the two builds of one exact version. Before, a `hydrateWithBackoff`
+  in one build joining an attempt from the other would retry a `ConfigInputError`. `instanceof
+  Error` still holds, each class has its own brand (`ConfigFloorError` is still neither of the
+  others), and a subclass keeps ordinary `instanceof`.
+
+### Decided
+
+- **Local precedence still reads the store** (item 17). With every mapped variable set locally,
+  `hydrate()` still makes its request: it also checks that the store and the grants exist. A
+  developer needs `az login`, or the connection-string path. Documented; no change.
+- **The retry floor stays global across key maps.** It bounds the store's quota, which every key
+  map shares. One key map per process is the supported shape, frozen by `1.0.0`.
+
+### Documentation
+
+- **Quota: the meter is not the request count** (item 19). On a capped tier the store meters
+  `RequestQuotaUsage`, and a Free-tier store was observed charging roughly 2 to 4 units per
+  request: a ceiling nearer 250 to 400 requests a day than 1,000. It reset daily between 00:00 and
+  01:00 UTC, and past it every reader gets HTTP 429, `Resource utilization has surpassed the
+  assigned quota`. Watch `RequestQuotaUsage`, not request counts, and count one load per worker
+  start, not per deploy: worker churn drives the load count, and nothing in-process can bound it.
+  On a capped tier a fail-fast consumer turns quota exhaustion into a hard outage at its next
+  worker start. For more than one consumer with churning workers, use a paid tier. The
+  per-attempt request costs measured on provider 2.6.0 stand; they are no longer compared with
+  1,000. No default moved.
+- Concurrent callers joining one in-flight attempt receive the identical rejection object
+  (item 14), now stated and pinned by a test.
+- Azure Functions: `gated()` for HTTP handlers; `retryAfterMs(error)` in the message-trigger wait;
+  a dedicated entry module for the `appStart` hook when `main` is a glob over several entry
+  modules, with a side-effect-free config module every handler imports (item 15); the example
+  logger's `error` now receives `hydrate()`'s failure line.
+- A "Testing a consumer" section (item 16): vitest's `server.deps.inline:
+  ['@actvalue/azure-app-config']`, without which `vi.mock` of the provider does not reach the
+  package's own import; mocking `load()`; and `resetHydration()` in `beforeEach`.
+
 ## 0.2.1 - released 2026-09-23
 
 What the second consumer found on `0.2.0`: a container web app on App Service. `BACKLOG.md`

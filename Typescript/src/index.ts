@@ -11,6 +11,7 @@ import {
 import type {
   BackoffOptions,
   CallRecord,
+  ConfigUnavailableResponse,
   CredentialEvidence,
   FailureObservation,
   HydrateOptions,
@@ -18,16 +19,60 @@ import type {
   HydrationState,
   HydrationStatus,
   KeyMap,
+  Logger,
 } from './interface';
+// Bundled at build time, so the registry key below is always the exact published version — never
+// a constant someone has to remember to bump.
+import { version } from '../package.json';
 
 export type {
   BackoffOptions,
+  ConfigUnavailableResponse,
   HydrateOptions,
   HydrationResult,
   HydrationStatus,
   KeyMap,
   Logger,
 } from './interface';
+
+/*
+ * ---------------------------------------------------------------------------------------------
+ * One package, possibly two module instances.
+ *
+ * The package ships an ESM and a CJS build, and a consumer graph can reach both — an ESM app
+ * importing it and a CJS dependency requiring it. Each build has its own module scope, so
+ * module-scope state would give that process two memos and two retry floors (the quota invariant
+ * spent twice), a resetHydration() that clears one of them, and error classes that fail
+ * `instanceof` across the copies. So the state lives on globalThis under a registered symbol, and
+ * the error classes carry a brand that `instanceof` checks.
+ *
+ * The error classes' brands carry no version, so `instanceof` matches an instance from either build
+ * of any version of the package; the state is shared only by the two builds of one exact version.
+ * Two different versions in one graph keep their own state — each version has its own floor —
+ * because nothing guarantees one version's state shape means the same to another, while what an
+ * error class means is part of the public contract.
+ * ---------------------------------------------------------------------------------------------
+ */
+
+const STATE_KEY = Symbol.for(`@actvalue/azure-app-config/state@${version}`);
+const INPUT_BRAND = Symbol.for('@actvalue/azure-app-config/ConfigInputError');
+const FLOOR_BRAND = Symbol.for('@actvalue/azure-app-config/ConfigFloorError');
+const LOAD_BRAND = Symbol.for('@actvalue/azure-app-config/ConfigLoadError');
+
+function brand(error: Error, mark: symbol): void {
+  Object.defineProperty(error, mark, { value: true, enumerable: false });
+}
+
+/**
+ * `instanceof` for a branded class. The class itself matches any instance carrying its brand,
+ * whichever module instance — either build, any version of the package — built it. A consumer's
+ * subclass of it keeps ordinary prototype semantics, since the static method is inherited and
+ * must not make every base instance match.
+ */
+function isBranded(constructor: object, own: object, mark: symbol, value: unknown): boolean {
+  if (constructor !== own) return Function.prototype[Symbol.hasInstance].call(constructor, value);
+  return typeof value === 'object' && value !== null && (value as Record<symbol, unknown>)[mark] === true;
+}
 
 /**
  * A load that failed for a reason retrying cannot change: a key map with a wildcard in it, no
@@ -55,8 +100,14 @@ export class ConfigInputError extends Error {
    */
   readonly reachedStore: boolean;
 
+  /** Matches a `ConfigInputError` from either build of any version of the package (a version-less brand). */
+  static [Symbol.hasInstance](value: unknown): boolean {
+    return isBranded(this, ConfigInputError, INPUT_BRAND, value);
+  }
+
   constructor(message: string, cause?: unknown, reachedStore = false) {
     super(message);
+    brand(this, INPUT_BRAND);
     this.name = 'ConfigInputError';
     this.cause = cause;
     this.reachedStore = reachedStore;
@@ -92,12 +143,21 @@ export class ConfigFloorError extends Error {
   /** Milliseconds to wait before the next call reaches the store: until the floor opens, plus 50 ms. */
   readonly retryAfterMs: number;
 
+  /**
+   * Matches a `ConfigFloorError` from either build of any version of the package (a version-less
+   * brand). Never a `ConfigLoadError` or `ConfigInputError`.
+   */
+  static [Symbol.hasInstance](value: unknown): boolean {
+    return isBranded(this, ConfigFloorError, FLOOR_BRAND, value);
+  }
+
   /** @param opensInMs Milliseconds until the floor opens, exactly. */
   constructor(opensInMs: number, lastError: unknown) {
     const last = lastError instanceof Error ? lastError.message : String(lastError);
     super(
       `App Configuration not attempted: the retry floor opens in ${Math.ceil(opensInMs / 1000)}s. The last attempt failed: ${last}`
     );
+    brand(this, FLOOR_BRAND);
     this.name = 'ConfigFloorError';
     this.cause = lastError;
     this.retryAfterMs = Math.max(0, Math.ceil(opensInMs)) + FLOOR_MARGIN_MS;
@@ -127,6 +187,11 @@ export class ConfigLoadError extends Error {
   /** Every distinct failure seen on the wire during the attempt. Empty if none got that far. */
   readonly observations: FailureObservation[];
 
+  /** Matches a `ConfigLoadError` from either build of any version of the package (a version-less brand). */
+  static [Symbol.hasInstance](value: unknown): boolean {
+    return isBranded(this, ConfigLoadError, LOAD_BRAND, value);
+  }
+
   constructor(
     message: string,
     cause: unknown,
@@ -135,6 +200,7 @@ export class ConfigLoadError extends Error {
   ) {
     const { detail, statusCode } = explain(cause, observations, credential, wireForNextError);
     super(`${message}: ${detail}`);
+    brand(this, LOAD_BRAND);
     this.name = 'ConfigLoadError';
     this.cause = cause;
     this.detail = detail;
@@ -203,10 +269,20 @@ const OPAQUE_PROVIDER_MESSAGES = [
 ];
 
 function freshState(): HydrationState {
-  return { calls: new Map() };
+  return { calls: new Map(), reportedInputErrors: new Set() };
 }
 
-let state: HydrationState = freshState();
+type Registry = Record<symbol, HydrationState | undefined>;
+
+/**
+ * The state every module instance of this version shares, created on first use. Read it once per
+ * operation and keep the object: resetHydration() replaces it, and a late rejection must be able
+ * to tell that its state has been replaced.
+ */
+function currentState(): HydrationState {
+  const registry = globalThis as unknown as Registry;
+  return (registry[STATE_KEY] ??= freshState());
+}
 
 /**
  * One attempt to read the store and write the environment.
@@ -220,27 +296,51 @@ let state: HydrationState = freshState();
  * *not* memoised — caching a rejected promise would make the first attempt the only one — but a
  * further call inside `retryFloorMs` rejects with a {@link ConfigFloorError} without touching the
  * store. Without that floor, eight queue triggers each re-hydrating on every invocation spend a
- * Free store's daily quota (1,000 requests, then HTTP 429 to every reader until midnight UTC) in
- * minutes, and starve every other consumer of the store with them.
+ * capped store's daily quota in minutes, and every reader of the store gets HTTP 429 until the
+ * meter resets. On a capped tier the meter is not the request count: a Free store was observed
+ * charging roughly 2–4 units per request, a ceiling nearer 250–400 requests a day.
  *
  * Every failure that reached the store arms the floor — a failed request, a missing key, and an
  * input error raised after the store answered. Only input rejected before any request leaves it
  * alone. A floor rejection's `retryAfterMs` includes a small margin, so a caller who waits exactly
  * that long reaches the store even if the timer fires a little early.
  *
+ * A failed attempt is logged once, `Configuration load failed: <message>`, through the `error`
+ * method of the logger of the call that started it (`log` if it has none). Callers that join it,
+ * memo hits and floor rejections log nothing, and every joiner receives the identical rejection
+ * object. A call rejected before any request — no endpoint, no label, a filter character, a bad
+ * timing option, or an input error the provider raises before its first request — is logged the
+ * same way the first time its message is seen, and not again until {@link resetHydration}. The line is the error's message: it names the store, the label, the
+ * keys or the cause, never a value. A logger that throws changes nothing about the rejection.
+ *
  * Nothing is written unless every key is usable: a rejection leaves `process.env` as it was.
  */
 export function hydrate(options: HydrateOptions): Promise<HydrationResult> {
+  return hydrateOnce(options, true);
+}
+
+/**
+ * {@link hydrate}, with the failure line switched by `reportFailures`. {@link hydrateWithBackoff}
+ * passes `false`: its `onError` — the default one or the caller's — already reports every failure
+ * it sees, with the delay, and a second line per failure would be noise. Internal, deliberately:
+ * a public option would be API for a problem no caller of `hydrate()` has.
+ */
+function hydrateOnce(options: HydrateOptions, reportFailures: boolean): Promise<HydrationResult> {
+  const state = currentState();
   let plan: Plan;
   try {
     plan = validate(options);
   } catch (error) {
-    // Rejected before any request, so it neither consumes the quota nor arms the floor.
+    // Rejected before any request, so it neither consumes the quota nor arms the floor. Not an
+    // attempt either, but a fail-fast caller answering 503 for it would otherwise be silent, so
+    // it is said once per distinct message rather than once per call.
+    if (reportFailures) reportOncePerMessage(state, options, error);
     return Promise.reject(error);
   }
 
   const record = state.calls.get(plan.fingerprint);
   if (record?.promise) {
+    // A joiner or a memo hit: the attempt that is answering logs for itself.
     return record.promise;
   }
 
@@ -249,13 +349,15 @@ export function hydrate(options: HydrateOptions): Promise<HydrationResult> {
     const opensInMs = state.failedAt + floorMs - Date.now();
     if (opensInMs > 0) {
       // Inside the floor. Say so, rather than re-throwing the last error as if it were new: the
-      // store is not touched, and a caller must be able to tell this from a fresh failure.
+      // store is not touched, and a caller must be able to tell this from a fresh failure. Not a
+      // failure, so not logged — or a trickle of messages would log one line each.
       return Promise.reject(new ConfigFloorError(opensInMs, state.lastError));
     }
   }
 
-  // Capture the state object, not the binding. A rejection that lands after resetHydration() must
-  // not clear a memo or re-arm a floor that belongs to the state which replaced this one.
+  // Capture the state object, not the registry entry. A rejection that lands after
+  // resetHydration() must not clear a memo or re-arm a floor that belongs to the state which
+  // replaced this one.
   const current = state;
   const entry: CallRecord = record ?? {};
   current.calls.set(plan.fingerprint, entry);
@@ -266,7 +368,7 @@ export function hydrate(options: HydrateOptions): Promise<HydrationResult> {
       return result;
     },
     (error: unknown) => {
-      if (state === current) {
+      if (currentState() === current) {
         const now = Date.now();
         entry.promise = undefined;
         entry.failedAt = now;
@@ -277,6 +379,17 @@ export function hydrate(options: HydrateOptions): Promise<HydrationResult> {
           current.floorMs = options.retryFloorMs ?? DEFAULT_RETRY_FLOOR_MS;
         }
       }
+      // Once per attempt, whoever else is waiting on it: this handler runs once, and every joiner
+      // gets the promise it rejects. An input error the provider raised before any request arms
+      // no floor, so every call would be a new attempt and a new line: it is a pre-request
+      // rejection like validate()'s, said once per distinct message.
+      if (reportFailures) {
+        if (error instanceof ConfigInputError && !error.reachedStore) {
+          reportOncePerMessage(currentState(), options, error);
+        } else {
+          reportFailure(options, `Configuration load failed: ${messageOf(error)}`);
+        }
+      }
       throw error;
     }
   );
@@ -285,13 +398,49 @@ export function hydrate(options: HydrateOptions): Promise<HydrationResult> {
   return attempt;
 }
 
+/** A pre-request rejection, logged the first time its message is seen in this state. */
+function reportOncePerMessage(state: HydrationState, options: HydrateOptions | undefined, error: unknown): void {
+  const message = messageOf(error);
+  if (state.reportedInputErrors.has(message)) return;
+  state.reportedInputErrors.add(message);
+  reportFailure(options, `Configuration load failed: ${message}`);
+}
+
+/**
+ * A failure line, through the logger's `error`, else its `log`. Never allowed to change the
+ * outcome: the options and the logger are read inside the guard — `hydrate(undefined)` or a
+ * throwing `logger` getter must still reject, not throw — and a logger that throws, or returns a
+ * promise that rejects, is swallowed here, so the caller still gets the load's own rejection and
+ * nothing goes unhandled.
+ */
+function reportFailure(options: HydrateOptions | undefined, line: string): void {
+  try {
+    const target: Logger = options?.logger ?? console;
+    const report = target.error ?? target.log;
+    const returned: unknown = report.call(target, line);
+    // Typed void, but a JavaScript logger may be async; its rejection must not go unhandled.
+    const then = (returned as { then?: unknown } | null | undefined)?.then;
+    if (typeof then === 'function') then.call(returned, undefined, () => undefined);
+  } catch {
+    // The load's rejection is what the caller needs; a broken logger is not news to add to it.
+  }
+}
+
+function messageOf(error: unknown): string {
+  try {
+    return error instanceof Error ? error.message : String(error);
+  } catch {
+    return 'an error that could not be described';
+  }
+}
+
 /**
  * What {@link hydrate} has done for this key map and label, without doing anything.
  *
  * **Never makes a request and never starts an attempt**, whatever the state — so a health
  * endpoint can report configuration health on every ping without spending the store's quota. On
- * a Free store, pinging `hydrate()` instead during an outage spends the day's requests within
- * about an hour, and no finite floor fixes that across several instances.
+ * a capped store, pinging `hydrate()` instead during an outage spends the day's quota within
+ * hours, and no finite floor fixes that across several instances.
  *
  * The label resolves as it does for `hydrate()`: the argument, else `APP_CONFIG_LABEL`. Throws
  * {@link ConfigInputError} for no keys, an unescaped `*` or `,` in a key, no label, or a `*` or `,`
@@ -305,6 +454,7 @@ export function hydrate(options: HydrateOptions): Promise<HydrationResult> {
  * the two agree.
  */
 export function hydrationStatus(keys: KeyMap, label?: string): HydrationStatus {
+  const state = currentState();
   const plan = planFor(keys, label);
   const record = state.calls.get(plan.fingerprint);
 
@@ -329,6 +479,79 @@ export function hydrationStatus(keys: KeyMap, label?: string): HydrationStatus {
 }
 
 /**
+ * How long to wait before calling {@link hydrate} again after it rejected with `error`, in
+ * milliseconds — or `undefined` when waiting will not help or is not needed. Makes no request.
+ *
+ * - A {@link ConfigFloorError}: its own `retryAfterMs`.
+ * - A {@link ConfigInputError}, whether or not it reached the store: `undefined`. Waiting won't
+ *   fix it; a change to the call or to the store will.
+ * - Anything else — a fresh failure: the time until the retry floor it armed opens, measured with
+ *   the `retryFloorMs` of the attempt that armed it (as `hydrationStatus().nextAttemptAt` is),
+ *   rounded up, plus the same 50 ms margin `ConfigFloorError.retryAfterMs` carries. `undefined`
+ *   if the floor is already open — `retryFloorMs: 0`, or a rejection that landed after
+ *   `resetHydration()` — which means the next call may go now.
+ *
+ * So `undefined` has two meanings: for a `ConfigInputError`, don't retry; for anything else,
+ * retry now. Tell them apart with `instanceof ConfigInputError`, not with this result. For an HTTP
+ * `Retry-After` (omitted either way), or a message handler's one wait before its second attempt.
+ */
+export function retryAfterMs(error: unknown): number | undefined {
+  if (error instanceof ConfigFloorError) return error.retryAfterMs;
+  if (error instanceof ConfigInputError) return undefined;
+  const state = currentState();
+  const wait = floorWaitMs(state, state.floorMs ?? DEFAULT_RETRY_FLOOR_MS);
+  return wait > 0 ? wait : undefined;
+}
+
+/**
+ * Wraps an HTTP handler so it runs only once configuration is loaded, and answers 503 otherwise.
+ *
+ * The returned function awaits `hydrate(options)`. On success it calls `handler` with the
+ * original arguments and returns what it returns; the handler's own errors propagate untouched.
+ * On any rejection it returns `{ status: 503, body: 'Service Unavailable' }`, with a
+ * `Retry-After` header in whole seconds (at least 1) whenever {@link retryAfterMs} gives a wait —
+ * none for a {@link ConfigInputError}, which waiting won't fix. It never rejects because of
+ * configuration and logs nothing itself: `hydrate()` logs the failed attempt, once.
+ *
+ * The response is a plain object, structurally an Azure Functions `HttpResponseInit`, so the
+ * package takes no dependency on `@azure/functions`:
+ *
+ * ```ts
+ * app.http('orders', { handler: gated(CONFIG, async (request, context) => ({ jsonBody: await orders() })) });
+ * ```
+ */
+export function gated<A extends unknown[], R>(
+  options: HydrateOptions,
+  handler: (...args: A) => R | Promise<R>
+): (...args: A) => Promise<R | ConfigUnavailableResponse> {
+  return async (...args: A) => {
+    try {
+      await hydrate(options);
+    } catch (error) {
+      return unavailable(error);
+    }
+    return handler(...args);
+  };
+}
+
+/** The 503. Nothing on this path may throw: a failure here would turn a 503 into a 500. */
+function unavailable(error: unknown): ConfigUnavailableResponse {
+  const response: ConfigUnavailableResponse = { status: 503, body: 'Service Unavailable' };
+  try {
+    const wait = retryAfterMs(error);
+    if (wait !== undefined) {
+      const seconds = Math.max(1, Math.ceil(wait / 1000));
+      // Whole seconds or nothing: a floor too large for an integer (allowed) would print in
+      // exponent notation, which no client reads as a delay.
+      if (Number.isSafeInteger(seconds)) response.headers = { 'Retry-After': String(seconds) };
+    }
+  } catch {
+    // No header, still a 503.
+  }
+  return response;
+}
+
+/**
  * Calls {@link hydrate} until it succeeds, widening the delay from `initialMs` to `maxMs`.
  * **Long-lived processes only.**
  *
@@ -345,6 +568,10 @@ export function hydrationStatus(keys: KeyMap, label?: string): HydrationStatus {
  * the floor opens and calls again. The effect is that a re-attempt lands at the floor rather than
  * at a shorter delay, which is immaterial when RBAC propagation is measured in minutes.
  *
+ * Failures are reported by `onError` alone — the default logs `Configuration load failed,
+ * retrying in <s>s: <message>`; a custom one replaces that line. The attempts this loop starts do
+ * not also log `hydrate()`'s own failure line, and neither does its rethrown `ConfigInputError`.
+ *
  * Never inside a function invocation: it does not return until the store answers, which can be
  * long after the invocation's own timeout.
  */
@@ -358,19 +585,17 @@ export async function hydrateWithBackoff(
   positive('initialMs', initialMs);
   positive('maxMs', maxMs);
   const floorMs = options.retryFloorMs ?? DEFAULT_RETRY_FLOOR_MS;
-  const logger = options.logger ?? console;
+  // The default report is guarded like hydrate()'s: a broken logger must not end the loop or
+  // leave a rejection unhandled. A custom onError is caller code, and keeps its own contract.
   const onError =
     backoff.onError ??
-    ((error: unknown, nextDelayMs: number) => {
-      const message = error instanceof Error ? error.message : String(error);
-      const report = logger.error ?? logger.log;
-      report.call(logger, `Configuration load failed, retrying in ${nextDelayMs / 1000}s: ${message}`);
-    });
+    ((error: unknown, nextDelayMs: number) =>
+      reportFailure(options, `Configuration load failed, retrying in ${nextDelayMs / 1000}s: ${messageOf(error)}`));
 
   let delay = initialMs;
   for (;;) {
     try {
-      return await hydrate(options);
+      return await hydrateOnce(options, false);
     } catch (error) {
       if (error instanceof ConfigInputError) throw error;
       if (error instanceof ConfigFloorError) {
@@ -382,7 +607,7 @@ export async function hydrateWithBackoff(
       }
       // Report when the next attempt will really happen: a failure that armed the floor holds the
       // next call back until it opens, however short the backoff delay.
-      const wait = Math.max(delay, floorWaitMs(floorMs));
+      const wait = Math.max(delay, floorWaitMs(currentState(), floorMs));
       onError(error, wait);
       await sleep(wait);
       delay = Math.min(delay * 2, maxMs);
@@ -390,13 +615,21 @@ export async function hydrateWithBackoff(
   }
 }
 
-/** Clears the memoised results, the recorded failures and the retry floor. For tests. */
+/**
+ * Clears the memoised results, the recorded failures, the retry floor and the set of pre-request
+ * errors already logged. For tests.
+ *
+ * It replaces the state every module instance of this version shares — the ESM and the CJS build
+ * alike. The other side of that: re-importing the package (`vi.resetModules()`,
+ * `jest.resetModules()` or `jest.isolateModules()`) no longer gives fresh state, so call
+ * `resetHydration()` in a `beforeEach` instead.
+ */
 export function resetHydration(): void {
-  state = freshState();
+  (globalThis as unknown as Registry)[STATE_KEY] = freshState();
 }
 
 /** How long a call with this floor would wait for the retry floor now, margin included; 0 if open. */
-function floorWaitMs(floorMs: number): number {
+function floorWaitMs(state: HydrationState, floorMs: number): number {
   if (state.failedAt === undefined) return 0;
   const opensInMs = state.failedAt + floorMs - Date.now();
   return opensInMs > 0 ? Math.ceil(opensInMs) + FLOOR_MARGIN_MS : 0;

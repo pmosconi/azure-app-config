@@ -14,8 +14,9 @@ no customer or internal project names, in code, tests, fixtures, comments or doc
 neutral key names (`shared:mongoUrl`, `myapp:httpPort`). Anything specific to the estate this was
 extracted from belongs in that estate's private repository, not here.
 
-Order of work: TypeScript first, shaped against a real Azure Functions consumer, then a second
-container consumer, then `1.0.0`. Python follows. See **Status** below.
+Order of work: TypeScript first, shaped against real consumers (three Functions apps and a
+container), frozen in `0.3.0`; then `1.0.0`, which adds the Python half and republishes the
+TypeScript half without a behaviour change. See **Status** below.
 
 ## Commands
 
@@ -40,8 +41,13 @@ without a real reason recorded in the commit message.
    `hydrateWithBackoff()` is the separate helper for long-lived processes.
 2. **Memoise success, never failure, and rate-limit retrying.** Caching a rejected promise makes
    the first attempt the only one. Not rate-limiting means every queue trigger re-attempts on
-   every invocation, which on the Free SKU (1,000 req/day, then 429 to every reader until
-   midnight UTC) spends the quota in minutes and starves every other consumer of the store.
+   every invocation, which on a capped tier spends the quota in minutes and starves every other
+   consumer of the store: past it, every reader gets 429 `Resource utilization has surpassed the
+   assigned quota` until the meter resets (observed daily between 00:00 and 01:00 UTC). **The
+   meter is not the request count** (`BACKLOG.md` item 19): a Free store's `RequestQuotaUsage`
+   was observed charging roughly 2–4 units per request, a ceiling nearer 250–400 requests a day
+   than 1,000. Reason in `RequestQuotaUsage`, and in loads per worker start — worker churn, not
+   traffic or deploys, drives the load count, and nothing in-process can bound it.
    Hence `retryFloorMs`: inside the floor, reject with a `ConfigFloorError` (`retryAfterMs`,
    `cause: lastError`) without touching the store. **What arms the floor is whether the attempt
    reached the store**, not what kind of error it ended in: a `ConfigInputError` raised after a
@@ -135,18 +141,22 @@ without a real reason recorded in the commit message.
   the failure, measured on provider 2.6.0: a 403 ≈ 1 request (the provider backs its client off
   after it, so its later passes inside the attempt send nothing); unreachable 0; a failure after
   a full read — a missing key — one per key, as a success. Under a persistent 403 attempts start
-  at ~0, 45, 90, 135, 190, 285, 460, 795 s, then every ~615 s: ~140 requests a day, 14% of the
-  Free tier. A persistent post-read failure settles to one attempt every ~600 s, ~144 a day, so
-  ~144 × keys requests a day: past 1,000 from 7 keys, from one process. At a 60 s cap it would be
-  over 1,100 attempts a day, past the quota even at one request each. Nothing needs a faster poll
-  — RBAC propagation is minutes in both directions, so a restored grant is not a restored
-  application. The provider's `Failed to load … Retrying in 5000 ms` warnings (~3 per attempt)
-  are its loop inside the startup timeout, not this schedule.
+  at ~0, 45, 90, 135, 190, 285, 460, 795 s, then every ~615 s: ~140 requests a day. A persistent
+  post-read failure settles to one attempt every ~600 s, ~144 a day, so ~144 × keys requests a
+  day. Those are requests, not quota units: against a Free store's observed 250–400-request
+  ceiling (invariant 2), one process under a persistent 403 spends a third or more of the day,
+  and a post-read failure with three keys all of it. At a 60 s cap it would be over 1,100
+  attempts a day. Nothing needs a faster poll — RBAC propagation is minutes in both directions,
+  so a restored grant is not a restored application. The provider's `Failed to load … Retrying in
+  5000 ms` warnings (~3 per attempt) are its loop inside the startup timeout, not this schedule.
 - **The floor alone bounds `hydrate()` callers on message triggers:** at most one attempt per
   floor window per process — up to 2,880 a day per process at the 30 s default while a failure
-  persists and messages keep arriving, each costing as above. A Functions app on a Free store
-  weighs that against its instance and key counts when it chooses `retryFloorMs`. Documented in
-  `0.2.1`; no default changed.
+  persists and messages keep arriving, each costing as above. A Functions app on a capped store
+  weighs that against its instance, key and worker-start counts when it chooses `retryFloorMs`.
+  Documented in `0.2.1`, the quota meter corrected in `0.3.0`; no default changed. **On a capped
+  tier a fail-fast consumer turns quota exhaustion into a hard outage at its next worker start**
+  (observed: 35 minutes of 503s from a new worker while loaded workers kept serving), so the docs
+  recommend a paid tier for more than one consumer with churning workers.
 - **The label is its own variable, never derived from `NODE_ENV`.** Images bake
   `ENV NODE_ENV=production`, so a staging container would read the production label and hit
   production databases. And in a Functions app `NODE_ENV` is an ordinary per-slot setting that
@@ -177,6 +187,12 @@ without a real reason recorded in the commit message.
   missing signal shows first as a stale value winning, and a consumer with no local settings left
   can never confirm the signal. Names only, never a value; still one `logger.log` line per
   successful attempt.
+- **Local precedence still reads the store — decided in `0.3.0`, `BACKLOG.md` item 17.** With
+  local wins and every mapped variable set locally, `attemptHydration` still loads first and
+  applies precedence after. Kept, not skipped: the request also checks that the store exists and
+  that the identity holds the grants the deployed application will need, which is what a local
+  run is for. A developer needs `az login`, or the connection-string path. Skipping would also add
+  a success that never touched the store, which a caller could not tell from a real one.
 - **`ConfigFloorError` extends `Error`, not `ConfigLoadError` or `ConfigInputError`.** A catch on
   `ConfigLoadError` means "a store attempt just failed" and counts it; a floor rejection attempted
   nothing, and its `cause` may be any of the three kinds. Not an input error, so
@@ -197,20 +213,90 @@ without a real reason recorded in the commit message.
   has no caller, and `hydrate()` enforces each caller's own `retryFloorMs`, so a caller passing a
   different value sees a different window in its own `ConfigFloorError`. Documented, not
   reconciled: a process passing one value, or none, sees the two agree.
-- **One key map per process is the supported shape. Known limitation, deferred to `1.0.0`.** The
-  floor is global because the quota is, so a key map that fails on every attempt holds the floor
-  shut for every other key map in the process, and a `hydrateWithBackoff` loop for another map can
-  be starved by it for as long as that lasts. Not changed in `0.2.0`: making the floor per key map
-  would spend the quota per map, which is the failure the floor exists to prevent.
+- **One key map per process is the supported shape — decided in `0.3.0`, frozen by `1.0.0`.** The
+  floor is global because the quota is: it bounds requests to the store, and every key map in
+  the process spends from the same quota. So a key map that fails on every attempt holds the
+  floor shut for every other key map in the process, and a `hydrateWithBackoff` loop for another
+  map can be starved by it for as long as that lasts. Making the floor per key map would spend
+  the quota per map, which is the failure the floor exists to prevent. Changing this after
+  `1.0.0` is a major.
 - **Timing options are validated before any request.** A NaN `retryFloorMs` makes every floor
   comparison false — the floor fails open — and a zero or NaN backoff delay spins. Large finite
   floors are allowed; `sleep()` steps waits past 2^31-1 ms, which `setTimeout` turns into 1 ms.
   `timeoutMs` is capped at 2^31-1 because the provider hands it to `setTimeout` unstepped.
 - **Writes are all or nothing.** Every entry is checked before `process.env` is touched, with no
   await in between, so a rejection means the environment is as it was.
-- **The logger is per attempt, not per call.** The call that starts an attempt logs it; joiners
-  and memo hits log nothing. Documented rather than fixed: a process-level `configureHydration()`
-  would be API for a problem a caller solves by passing a process-level logger.
+- **The logger is per attempt, not per call.** The call that starts an attempt logs it — the
+  success line through `log`, or since `0.3.0` the failure line through `error` (else `log`);
+  joiners, memo hits and floor rejections log nothing. Documented rather than fixed: a
+  process-level `configureHydration()` would be API for a problem a caller solves by passing a
+  process-level logger.
+- **`hydrate()` logs a failed attempt once — `0.3.0`, `BACKLOG.md` item 12.** Text
+  `Configuration load failed: <error.message>`, the line two fail-fast consumers logged
+  themselves, so deleting theirs changes no log. Logged in the attempt's rejection handler, which
+  runs once however many callers joined, so it is once per attempt by construction; joiners get
+  the identical rejection object (item 14, pinned). A pre-request rejection is not an attempt, but
+  a fail-fast caller answering 503 for it would be silent, so it is logged the first time its
+  message is seen in the current state (`reportedInputErrors`, cleared by `resetHydration()`).
+  That covers `validate()`'s rejections and a `ConfigInputError` with `reachedStore: false` from
+  the provider, which arms no floor and so would otherwise log on every call; a `reachedStore:
+  true` one logs per attempt like any failure, and the floor spaces those out. The set grows once
+  per distinct message and is cleared only by `resetHydration()` — the same growth class as the
+  per-fingerprint memo, and deliberately uncapped: options built per request with varying bad
+  values log, and store, each distinct message. One constant options object is the supported
+  shape. The options and the logger are read inside the guard, so `hydrate(undefined)` and a
+  throwing `logger` getter still reject rather than throw, and a throw, or an async logger's
+  rejection, is swallowed, because logging must never change the outcome. Never a value — the
+  line is the message.
+- **`hydrateWithBackoff` does not double-log.** Its `onError` — default or custom — already
+  reports every failure with the delay, and a container consumer's custom `onError` logs the
+  failure itself. So the attempts it starts go through the internal `hydrateOnce(options, false)`,
+  and its pre-request rethrow is unlogged too. Its default `onError` goes through the same guarded
+  helper, so a broken logger neither ends the loop nor leaves a rejection unhandled; a custom
+  `onError` that throws still ends it — caller code keeps its contract. An internal flag, not a
+  public option: no caller of
+  `hydrate()` needs to switch its failure line off. A `hydrate()` call joining an attempt the loop
+  started logs nothing (it is a joiner); a loop joining an attempt a `hydrate()` call started gets
+  that attempt's line and its own `onError` line — an accepted edge of mixing both in one process.
+- **`retryAfterMs(error)` — `0.3.0`, item 13 — replaces the consumers' hardcoded margin.** A
+  `ConfigFloorError`: its own. Any `ConfigInputError`: `undefined`, waiting won't fix it, even when
+  it armed the floor. Anything else: the floor armed now, by `state.floorMs` (as
+  `hydrationStatus` measures it), ceil'd, plus `FLOOR_MARGIN_MS`; `undefined` if open, meaning
+  retry now. So `undefined` has two meanings, and callers branch on `instanceof
+  ConfigInputError`, never on `undefined` — the README's message-trigger recipe does. It reads
+  the current floor rather than the error, so an old error asked about later gets today's wait —
+  which is what a caller about to retry needs. `FLOOR_MARGIN_MS` stays unexported: the helper is
+  the one place it is added.
+- **`gated(options, handler)` — `0.3.0`, item 18 — is structural.** It returns
+  `ConfigUnavailableResponse` (`{ status: 503; body; headers? }`), assignable to `HttpResponseInit`,
+  with no runtime or type dependency on `@azure/functions`; `test/gated.test.ts` proves the fit
+  against the real types, a devDependency. It never rejects because of configuration and never
+  logs (item 12 does); the handler's own errors are not its business. `Retry-After` is whole
+  seconds, at least 1, from `retryAfterMs`, and omitted when that is `undefined` or the value is
+  not a safe integer — a floor too big for one prints in exponent notation. One wrapper, one
+  export: an HTTP-only shape, because only HTTP consumers fail fast.
+- **Two builds, one state — `0.3.0`.** tsup emits ESM and CJS, and a graph reaching both used to
+  get two module-scope states: two floors (the quota invariant spent twice), a `resetHydration()`
+  that cleared one, and `instanceof` failing across copies — a `hydrateWithBackoff` in one copy
+  joining the other's attempt would retry a `ConfigInputError`. The state now lives at
+  `globalThis[Symbol.for('@actvalue/azure-app-config/state@<version>')]`, created on first use,
+  the version bundled from `package.json` at build time (never a hand-kept constant).
+  **Keyed on the exact version**: both builds of one version share it; two versions in one graph
+  keep separate state — each has its own floor — because nothing guarantees one version's state
+  shape means the same to another. `resetHydration()` replaces the registry entry; a late
+  rejection still compares against the state object it captured. The error classes carry brands
+  (`Symbol.for(...)`, non-enumerable) and `static [Symbol.hasInstance]` checking them. The error
+  classes' brands carry no version, so `instanceof` matches an instance from either build of any
+  version of the package; the state is shared only by the two builds of one exact version. Each
+  class has its own brand, so
+  `ConfigFloorError` is still not a `ConfigLoadError`; a consumer's subclass keeps prototype
+  semantics. The cost: re-importing the package in a test (`vi.resetModules`,
+  `jest.isolateModules`) no longer gives fresh state — call `resetHydration()`. Test files stay
+  isolated: Jest and vitest (default isolation) give each file its own `globalThis`. The unit
+  suite simulates the second build with `vi.resetModules()`; `scripts/check-dist.mjs` (run by
+  `prepublishOnly` after the build, and as `npm run check:dist`) loads the real `dist/index.mjs`
+  and `dist/index.js` in one process and checks the shared floor, the shared reset, cross-build
+  `instanceof`, and that `dist/index.d.ts` does not import `@azure/functions`.
 
 ## Conventions
 
@@ -227,6 +313,18 @@ without a real reason recorded in the commit message.
   ones allowed, and the wire evidence reported as facts and candidates, counted at the timeout.
   And from `0.2.1`: the success line's precedence mode in all four cases (signal present or
   absent, option true or false), the string `"false"` and `null`, and the `0.2.0` prefix intact.
+  And from `0.3.0`: the failure line once per attempt, through `error` with the `log` fallback,
+  and none for joiners, memo hits or floor rejections; joiners receiving the identical rejection;
+  a pre-request rejection logged once per message and again after a reset, the provider's own
+  `reachedStore: false` input error included; no value in the line; a throwing or rejecting
+  logger leaving the outcome unchanged, `hydrate(undefined)` and a throwing `logger` getter
+  rejecting rather than throwing, and `hydrateWithBackoff`'s default `onError` surviving a broken
+  logger; `hydrateWithBackoff` adding no
+  line with a custom `onError` and exactly its own with the default; `retryAfterMs` for each kind,
+  with the margin and no request; `gated` returning the handler's result, passing its errors
+  through, answering 503 with and without `Retry-After`, never rejecting, and fitting
+  `app.http()` at compile time; and two module instances sharing memo, floor and reset, with
+  errors matching across them and no brand matching another class.
 - **Error fixtures must match the provider's real shape**, which `test/helpers.ts` records with
   source line numbers. A fixture easier to unwrap than reality certifies the bug it was written
   to catch.
@@ -248,7 +346,16 @@ without a real reason recorded in the commit message.
   `0.2.0` prefix, then ` (store|local wins: <reason>)` after the list, word for word, with the
   reason built from the effective decision (`local_overrides_win option true|false`, or the
   signal when the option is `None`), and `hydrate_with_backoff` still re-raising every
-  `ConfigInputError`. `CHANGELOG.md` lists them.
+  `ConfigInputError`. **Every `0.3.0` behaviour is spec too:** `retry_after_ms(error)` with the
+  same three branches; the failure line `Configuration load failed: <message>` once per attempt
+  through the logger of the call that started it (`error`, else `log`), once per distinct message
+  for a pre-request rejection, never for a joiner, a memo hit or a floor rejection, and never
+  changing the outcome; joiners receiving the identical exception object; `hydrate_with_backoff`
+  not double-logging; and a `gated` equivalent answering the same 503 and `Retry-After` for
+  whatever HTTP shape Python consumers use. The dual-build registry and the error brands have no
+  Python counterpart: a Python process imports a module once, so there is one state and one set
+  of classes by construction — say so in the Python half rather than inventing a registry.
+  `CHANGELOG.md` lists them.
 
 ## Status
 
@@ -263,13 +370,15 @@ without a real reason recorded in the commit message.
       `BACKLOG.md` items 8–11
 - [x] Decide `BACKLOG.md` items 8–11: 8, 9 and 11 shipped in `0.2.1`, a patch release no
       consumer has to change code for; 10 decided not done
-- [ ] `1.0.0` published to npm — only after both consumers run on it
-- [ ] Python half, then its own second consumer
-
-Open, deferred to `1.0.0`: the memoised state is module-scope, so a consumer graph reaching both
-the ESM and the CJS build gets two of it and `resetHydration()` clears one. A `globalThis` symbol
-registry fixes it; whether two *versions* of the package in one graph should share state needs
-deciding first.
+- [x] Third and fourth consumers: Functions apps with HTTP triggers only, failing fast, converted
+      onto `0.2.1` with no library change. Their findings are `BACKLOG.md` items 12–19
+- [x] `0.3.0`: items 12–19 shipped or decided, and both items once deferred to `1.0.0` settled —
+      the dual-build state (a version-keyed `globalThis` registry) and starvation across key maps
+      (global floor, documented). The TypeScript API freeze candidate
+- [ ] `0.3.0` published, and the consumers' workarounds deleted (`CHANGELOG.md` lists them)
+- [ ] API review across both halves, then `1.0.0`: the Python half, and the TypeScript half
+      republished without a behaviour change
+- [ ] The Python half's own second consumer
 
 The second consumer's inlined copy of the hydrator is still part of the specification: read it
 before changing behaviour it relies on, and delete it when that consumer converts.

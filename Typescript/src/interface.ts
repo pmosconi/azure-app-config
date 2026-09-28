@@ -51,10 +51,13 @@ export interface HydrateOptions {
    *
    * For `hydrate()` callers on message triggers this is the only limit: at most one attempt per
    * floor window per process, so up to 2,880 a day per process at the default while a failure
-   * persists and messages keep arriving. Each costs what its failure costs (see
-   * {@link BackoffOptions.maxMs}), so a 403 alone can pass a Free store's 1,000 from one process.
-   * A Functions app on a Free store should weigh that against its instance count, and its key
-   * count, when it chooses this value.
+   * persists and messages keep arriving. Each costs what its failure costs in requests (see
+   * {@link BackoffOptions.maxMs}), so on a capped store a 403 alone can use up the day's quota from
+   * one process. On a capped tier the quota meter (`RequestQuotaUsage`) is not the request count:
+   * a Free store was observed charging roughly 2–4 units per request, a ceiling nearer 250–400
+   * requests a day. A Functions app on a capped store should weigh that against its instance
+   * count, its key count and its worker churn — every worker start loads again — when it chooses
+   * this value.
    */
   retryFloorMs?: number;
   /**
@@ -77,11 +80,17 @@ export interface HydrateOptions {
   /**
    * Defaults to `console`.
    *
+   * `log` receives the success line. `error` — `log` when there is no `error` — receives
+   * `Configuration load failed: <message>` once per failed attempt, and once per distinct message
+   * for a call rejected before any request, by this package or by the provider. Never a value, and a logger that throws never changes
+   * the outcome.
+   *
    * Per attempt, not per call: the attempt logs through the logger of the call that started it.
    * A caller that joins an attempt already in flight, or that is handed a memoised success, logs
-   * nothing through its own. So a per-invocation logger — a Functions `InvocationContext` — records
-   * the success line only in whichever invocation happened to start the attempt. Pass a
-   * process-level logger if every line must land in one place.
+   * nothing through its own, and a `ConfigFloorError` is not logged at all. So a per-invocation
+   * logger — a Functions `InvocationContext` — records the attempt's lines only in whichever
+   * invocation happened to start it. Pass a process-level logger if every line must land in one
+   * place. Attempts `hydrateWithBackoff` starts report failures through its `onError` instead.
    */
   logger?: Logger;
 }
@@ -136,8 +145,11 @@ export interface BackoffOptions {
    * read — a missing key — costs one per key, as a success does. At the 600 s cap a persistent 403
    * settles to an attempt every ~615 s (the cap plus the startup timeout), about 140 requests a
    * day; a persistent failure after a full read to one every ~600 s, about 144 × the number of
-   * keys a day, past a Free store's 1,000 from 7 keys on. At a 60 s cap it would be over 1,100
-   * attempts a day, past the quota even at one request each. Nothing is waiting on a faster poll —
+   * keys requests a day. At a 60 s cap it would be over 1,100 attempts a day. Those are requests:
+   * on a capped tier the quota meter (`RequestQuotaUsage`) charges more than one unit each — a
+   * Free store was observed at roughly 2–4, a ceiling nearer 250–400 requests a day. So from one
+   * process a persistent 403 spends a third or more of a Free store's day, and a failure after a
+   * full read with three keys all of it. Nothing is waiting on a faster poll —
    * role-assignment changes take minutes to propagate in both directions, so a restored grant is
    * not a restored application either way. A finite number above 0.
    */
@@ -146,7 +158,9 @@ export interface BackoffOptions {
    * Called with every failed attempt and the wait before the next one — the backoff delay, or the
    * time until the retry floor opens if that is longer, since the next call cannot reach the
    * store before then. Never called for a `ConfigFloorError`, which is not a failed attempt.
-   * Defaults to logging.
+   * Defaults to logging `Configuration load failed, retrying in <s>s: <message>` through the
+   * logger's `error` (else `log`). The only report of a failure the loop sees: its attempts do
+   * not also log `hydrate()`'s failure line, so a custom `onError` that logs gets one line each.
    */
   onError?: (error: unknown, nextDelayMs: number) => void;
 }
@@ -173,11 +187,26 @@ export interface CredentialEvidence {
 }
 
 /**
- * All the state the module holds, in one object so that `resetHydration()` clears every part of
+ * What {@link gated} answers when configuration is not loaded: a 503 with a fixed body, and a
+ * `Retry-After` in whole seconds when waiting will help.
+ *
+ * Structural on purpose. It is assignable to an Azure Functions `HttpResponseInit`, so a gated
+ * handler registers with `app.http()` as it is, without this package depending on
+ * `@azure/functions` at run time or for its types.
+ */
+export type ConfigUnavailableResponse = {
+  status: 503;
+  body: string;
+  headers?: Record<string, string>;
+};
+
+/**
+ * All the state the package holds, in one object so that `resetHydration()` clears every part of
  * it — the memoised successes and the retry floor's bookkeeping alike. A floor whose timestamp
  * survived a reset would make the first attempt after it re-throw a discarded error.
  *
- * Internal: not exported from the package.
+ * Kept on `globalThis` under a symbol keyed on the exact package version, so the ESM and the CJS
+ * build of one version share it. Internal: not exported from the package.
  */
 export interface HydrationState {
   /**
@@ -199,6 +228,11 @@ export interface HydrationState {
   lastError?: unknown;
   /** The `retryFloorMs` of the attempt that armed the floor, for `hydrationStatus`. */
   floorMs?: number;
+  /**
+   * Messages of the pre-request rejections already logged, so each is said once rather than once
+   * per call. Cleared with the rest by `resetHydration()`.
+   */
+  reportedInputErrors: Set<string>;
 }
 
 /**

@@ -147,7 +147,157 @@ The second consumer, a container web app on App Service, converted to `0.2.0`, a
 - **Proposal:** a README note in the Functions section: pass a `logger` whose `log` writes at warn level, or raise the relevant category in `host.json`.
 - **Consumer workaround:** the first consumer passes a logger that maps `log` to `console.warn`.
 
+## Found by the third consumer, on `0.2.1`
+
+The third consumer is a Functions app with HTTP triggers only. It converted to `0.2.1` with no
+library change. It answers a failed load with an immediate 503 and never waits for the floor.
+
+### 12. `hydrate()` does not report a failed attempt, so each Functions consumer writes its own
+
+**Shipped in 0.3.0.** A failed attempt logs `Configuration load failed: <message>` once, through the `error` method (else `log`) of the logger of the call that started it. Joiners, memo hits and `ConfigFloorError` rejections log nothing. A pre-request rejection is logged once per distinct message until `resetHydration()`. A throwing logger changes nothing, and `hydrateWithBackoff` does not double-log: its `onError` stays the only report.
+
+**Priority: low. Candidate for `1.0.0`.**
+
+- **Now:** `hydrate()` logs its success line through the caller's `logger`, but it logs no failure.
+  Only `hydrateWithBackoff`'s default `onError` does. Every caller that is not
+  `hydrateWithBackoff` has to log the failure itself.
+- **Problem:** requests that join one in-flight attempt all receive the same rejection. A caller that
+  logs in its `catch` therefore writes one line per waiting request unless it deduplicates. A
+  caller must also leave out `ConfigFloorError`, or it writes one line per call inside the floor.
+  The two Functions consumers now do this differently:
+  - the first logs at warn from its wait-and-retry helper;
+  - the third deduplicates on the error object's identity and logs at error.
+  
+  The prefixes and levels drift between them.
+- **Proposal:** log a failed attempt once, through the `logger.error` of the call that started it,
+  as the success line already goes through that call's `logger.log`. Never log a
+  `ConfigFloorError`. The consumers can then drop their own lines. The line should keep the
+  message's current guarantee: it names the endpoint, the label, the keys and the cause, never a
+  value.
+- **Consumer workaround:** the third consumer keeps a module-level `lastLogged` and writes one
+  `console.error` per distinct rejection. Delete it when this ships.
+- **Fourth consumer (below):** it carries the same code, about 60 lines, copied unchanged. That
+  makes two copies to delete.
+
+## Found by the fourth consumer, on `0.2.1`
+
+The fourth consumer is a Functions app with HTTP triggers only. It has no single entry file: its
+`main` is a glob over several entry modules. It converted to `0.2.1` with no library change and uses
+the third consumer's fail-fast shape.
+
+### 13. A fresh failure's `Retry-After` needs a constant the package does not export
+
+**Shipped in 0.3.0.** `retryAfterMs(error)` returns a `ConfigFloorError`'s own wait, `undefined` for any `ConfigInputError`, and otherwise the time until the armed floor opens, margin included, or `undefined` if it is open. It makes no request. `FLOOR_MARGIN_MS` stays unexported.
+
+**Priority: low. Goes with item 12.**
+
+- **Now:** `ConfigFloorError.retryAfterMs` carries the time until the floor opens plus a 50 ms
+  margin. A fresh failure carries no such figure, so a fail-fast caller computes it from
+  `hydrationStatus(keys).nextAttemptAt` and adds the margin again. `FLOOR_MARGIN_MS` is not
+  exported, so the caller hardcodes 50.
+- **Proposal:** give a fresh floor-arming failure the same `retryAfterMs`, or export the margin. If
+  item 12's logging moves into the package, a small helper returning "retry after" for any
+  rejection would remove the rest of the consumers' copy.
+- **Consumer workaround:** both fail-fast consumers keep a local `FLOOR_MARGIN_MS = 50`.
+
+### 14. Document that callers joining an attempt receive the same rejection object
+
+**Shipped in 0.3.0.** The README states it and a test pins it. Item 12 makes the consumers' dedupe on it unnecessary.
+
+**Priority: low. Docs only.**
+
+- **Now:** concurrent `hydrate()` calls for one key map and label share one in-flight promise, so
+  every joiner receives the identical error object. Both fail-fast consumers deduplicate their
+  failure line on that identity, but the README doesn't promise it.
+- **Proposal:** state it in the README and pin it with a test, or make it unnecessary through
+  item 12.
+
+### 15. README: where the `appStart` hook goes when there is no single entry file
+
+**Shipped in 0.3.0.** The Functions section shows a dedicated entry module that registers only the hook, and a config module with no side effects that every handler imports.
+
+**Priority: low. Docs only.**
+
+- **Now:** the README's hook example assumes one entry file. Under the v4 Node model, `main` can be
+  a glob, and then every matched module is an entry point. Registering the hook in a shared module
+  imported by several handlers works only because of module caching. A dedicated entry module
+  that registers only the hook is clearer and easy to test.
+- **Proposal:** add that case to the Functions section: one dedicated entry module that registers
+  the hook and nothing else, and a config module with no side effects.
+
+### 16. README: how a consumer tests against the real package with the provider mocked
+
+**Shipped in 0.3.0.** A "Testing a consumer" section covers `server.deps.inline`, why it is needed, mocking `load()`, and `resetHydration()` between tests, which re-importing no longer replaces.
+
+**Priority: low. Docs only.**
+
+- **Now:** a consumer that wants its tests to run the real package, with only the provider's
+  `load()` replaced, must make its test runner process the package itself. For vitest that means
+  `server.deps.inline: ['@actvalue/azure-app-config']`; otherwise `vi.mock` of the provider
+  doesn't reach the package's own import of it. Three consumers found this out independently.
+- **Proposal:** add a short "Testing a consumer" section to the README.
+
+### 17. With local precedence, a fully local environment still needs the store
+
+**Decided in 0.3.0: kept, and documented.** The request also checks that the store exists and that the identity holds its grants. A developer needs `az login`, or the connection-string path. README (Precedence) and CLAUDE.md say so.
+
+**Priority: low. Decide for `1.0.0`.**
+
+- **Now:** `attemptHydration` loads the store first and applies precedence afterwards. A developer
+  who has set every mapped variable locally still needs the endpoint, a credential and a
+  reachable store, and gets a load failure when any of these is missing.
+- **Options:**
+  - skip the request when local precedence is on and every mapped variable is already set
+    locally, and log that no request was made;
+  - or keep the current behaviour and document it, since the request also checks that the store
+    and the grants are in place.
+- **Consumer workaround:** none; developers run `az login`.
+
+### 18. A gate helper for HTTP handlers
+
+**Shipped in 0.3.0.** `gated(options, handler)` answers `ConfigUnavailableResponse`, a structural type with no dependency on `@azure/functions`: 503, `Service Unavailable`, and `Retry-After` in whole seconds when `retryAfterMs` gives a wait. It never rejects because of configuration and logs nothing itself. A compile-time test proves it fits `app.http()`.
+
+**Priority: low. Idea for `0.3.0`, after item 12.**
+
+- **Now:** each fail-fast consumer pastes the same gate at the top of every handler that reads a
+  hydrated value: await the check, then return the 503 if there is one. A new handler that forgets
+  it reads undefined values.
+- **Proposal:** once item 12 is in the package, a wrapper such as `gated(handler, options)` that
+  returns the 503 response with `Retry-After`. Gating then becomes part of registering the handler.
+  It needs care, because the package would take a dependency on the Functions HTTP types. A
+  structural type, or a separate entry point, avoids that.
+
+### 19. On a capped store, the quota meter is not the request count, and fail fast turns exhaustion into an outage
+
+**Shipped in 0.3.0 (docs only).** The README, the JSDoc and CLAUDE.md now reason in `RequestQuotaUsage` and in loads per worker start. They give the observed Free-tier ceiling of about 250 to 400 requests a day, the reset window and the 429 message, and they warn that fail fast turns exhaustion into an outage at the next worker start. They recommend a paid tier for more than one consumer with churning workers. No default moved.
+
+**Priority: medium for the docs. Observed on the Free tier, same day as the fourth consumer's deploy.**
+
+- **What happened:** the store's quota meter (`RequestQuotaUsage`) reached 100% while the request
+  metric (`HttpIncomingRequestCount`) showed about 400 requests that day. The meter had charged
+  roughly 2 to 4 units per metered request all day. A fail-fast consumer then started a new
+  worker, could not load, and answered 503 to every request for 35 minutes, until the store moved
+  to a paid tier. Consumers that had already loaded kept serving from their cached configuration.
+- **What drove it:** one consumer's host started a new worker instance every few minutes, and each
+  one loads the store again. On a capped tier, the load count follows worker churn, not traffic.
+- **Where the docs are wrong:** the README and item 8's quota figures reason in requests against
+  a cap of 1,000 a day. Measured, the Free-tier ceiling was nearer 250 to 400 requests a day. The
+  meter reset daily between 00:00 and 01:00 UTC. The 429 message is `Resource utilization has
+  surpassed the assigned quota`.
+- **Proposal:**
+  - Correct the quota section. Tell readers to watch `RequestQuotaUsage` rather than request
+    counts, and to count one load per worker start, not per deploy.
+  - State plainly that on a capped tier, a fail-fast consumer turns quota exhaustion into a hard
+    outage at its next worker start.
+  - Recommend a paid tier for more than one consumer with churning workers.
+- **Not a code change:** the floor and the memo behaved as designed. The per-process floor doesn't
+  bound the load count across worker starts, and nothing in-process can.
+
 ## Already open
 
 - ESM/CJS dual state (CLAUDE.md, **Status**, deferred to `1.0.0`). The first consumer is CJS-only and adds nothing new.
+
+  **Shipped in 0.3.0.** The state lives on `globalThis` under a symbol keyed on the exact package version, so the two builds of one version share one memo and one floor, and `resetHydration()` clears both. Two versions in one graph keep separate state. The error classes carry brands that `instanceof` checks across copies. Re-importing the package in a test no longer gives fresh state.
 - Starvation across key maps (CLAUDE.md, decisions, deferred to `1.0.0`). The retry floor is global, so a key map that fails on every attempt keeps the floor shut for every other key map in the process, and can starve a `hydrateWithBackoff` loop for another map. One key map per process is the supported shape until this is decided.
+
+  **Decided in 0.3.0: the floor stays global.** It bounds the store's quota, which every key map shares. `1.0.0` freezes "one key map per process is the supported shape", so changing it later is a major.

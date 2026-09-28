@@ -11,11 +11,11 @@ npm install @actvalue/azure-app-config       # TypeScript
 pip install actvalue.azure-app-config        # Python — not yet written
 ```
 
-> **Status: pre-1.0.** The TypeScript half is on npm and runs in production in two consumers, both
-> on `0.2.0`: an Azure Functions app and a container web app on App Service. `1.0.0` is published
-> once both run on it. Until then a minor version may break things;
+> **Status: pre-1.0.** The TypeScript half is on npm and runs in production in four consumers:
+> three Azure Functions apps and a container web app on App Service. `0.3.0` is the candidate for
+> its frozen API: `1.0.0` adds the Python half and republishes the TypeScript half without a
+> behaviour change. Until then a minor version may break things;
 > [`CHANGELOG.md`](CHANGELOG.md) says what, and which workarounds each release lets you delete.
-> The Python half follows.
 
 ## What it does
 
@@ -71,11 +71,33 @@ backoff loop is a separate helper that only a long-lived process calls.
 
 **Success is memoised; failure is not — but retrying is rate-limited.** Caching a rejected
 promise makes the first attempt the only one. Not caching it at all means every queue trigger
-re-attempts on every invocation, and on the Free SKU (1,000 requests a day, then HTTP 429 to
-every reader until midnight UTC) a handful of triggers spend the daily quota in minutes and take
-down every other consumer of the store with them. So after a failure `hydrate()` refuses to
-re-attempt for `retryFloorMs`, and rejects with a `ConfigFloorError` instead — its own class, so a
-caller can tell it from a fresh failure, carrying how long until the floor opens.
+re-attempts on every invocation, and on a capped tier such as Free — where, past the daily quota,
+every reader gets HTTP 429 until the meter resets (see [the store's quota](#the-stores-quota)) — a
+handful of triggers spend the day's quota in minutes and take down every other consumer of the
+store with them. So after a failure `hydrate()` refuses to re-attempt for `retryFloorMs`, and
+rejects with a `ConfigFloorError` instead — its own class, so a caller can tell it from a fresh
+failure, carrying how long until the floor opens.
+
+## The store's quota
+
+On a capped tier, such as Free, **the quota meter is not the request count.** The store meters
+`RequestQuotaUsage`, and a Free-tier store was observed charging it roughly 2 to 4 units per
+request, all day: the meter reached 100% with the request metric (`HttpIncomingRequestCount`) at
+about 400. Plan for a ceiling nearer 250 to 400 requests a day than the 1,000 a request count
+suggests. The meter reset daily between 00:00 and 01:00 UTC; past it, every reader of the store
+gets HTTP 429, `Resource utilization has surpassed the assigned quota`, until then.
+
+- **Watch `RequestQuotaUsage`**, not request counts.
+- **Count one load per worker start, not per deploy.** Each new worker loads the store again, so
+  on a host that starts a new worker every few minutes the load count follows worker churn, not
+  traffic. Nothing in-process can bound it: the memo and the floor are per process.
+- **On a capped tier, a fail-fast consumer turns quota exhaustion into a hard outage at its next
+  worker start.** The new worker cannot load and answers 503 to every request until the meter
+  resets, while workers that had already loaded keep serving from what they hold.
+- **For more than one consumer with churning workers, use a paid tier.**
+
+The request costs below — per attempt, measured on provider 2.6.0 — are requests. On a capped tier
+turn them into quota units before comparing them with anything.
 
 ## Two shapes
 
@@ -109,12 +131,13 @@ costs depends on how it fails. Measured on provider 2.6.0:
 
 Under a persistent 403 the default backoff starts attempts at about 0, 45, 90, 135, 190, 285, 460
 and 795 s, then one every ~615 s (the cap plus the startup timeout): about 140 attempts and about
-140 requests a day, 14% of a Free store's 1,000. A failure after a full read returns at once, so
-at the cap it settles to one attempt every ~600 s, about 144 a day, and costs about 144 × the
-number of keys: past the whole Free quota from 7 keys on, from one process. At a one-minute cap
-it would be over 1,100 attempts a day, past the quota even at one request each. Nothing is
-waiting on a faster poll — role-assignment changes take minutes to propagate in both directions,
-so a restored grant is not a restored application either way.
+140 requests a day, from one process. A failure after a full read returns at once, so at the cap
+it settles to one attempt every ~600 s, about 144 a day, and costs about 144 × the number of keys
+in requests. Against a Free store's ceiling (above), one process under a persistent 403 spends a
+third or more of the day's quota, and a failure after a full read with three keys all of it. At a
+one-minute cap it would be over 1,100 attempts a day. Nothing is waiting on a faster poll —
+role-assignment changes take minutes to propagate in both directions, so a restored grant is not a
+restored application either way.
 
 The provider's own `Failed to load … Retrying in 5000 ms` warnings, about three per attempt, are
 its internal loop inside the startup timeout, not this retry schedule.
@@ -130,7 +153,10 @@ import { hydrate } from '@actvalue/azure-app-config';
 
 const CONFIG = {
   keys: KEYS,
-  logger: { log: (m: string) => console.warn(m), error: (m: string) => console.error(m) },
+  logger: {
+    log: (m: string) => console.warn(m),    // the success line, at warn so host.json keeps it
+    error: (m: string) => console.error(m), // a failed attempt, logged once by hydrate()
+  },
 };
 
 app.serviceBusQueue('Rollup', {
@@ -149,9 +175,32 @@ not something a package can do for you.
 `logger.log`, which with the default logger is `console.log`, at Information level. A typical
 `host.json` sets `logLevel.default` to `Warning` and raises only `Function` to `Information`, so a
 line from an attempt started outside an invocation — by an `appStart` hook — is filtered out. On a
-slot where only a health endpoint runs, that line is the only evidence of a load. The logger is per
-attempt (below), so whichever call starts an attempt is the one that logs it: that is why every
-call here passes `CONFIG`, a retry included.
+slot where only a health endpoint runs, that line is the only evidence of a load. A failed attempt
+goes through `logger.error`, once (see [`hydrate`](#hydrateoptions-promisehydrationresult)), so a
+handler does not log it again. The logger is per attempt (below), so whichever call starts an
+attempt is the one that logs it: that is why every call here passes `CONFIG`, a retry included.
+
+**An HTTP handler that fails fast: `gated()`.** A handler that reads hydrated values and answers
+503 while configuration is not loaded registers through `gated()`, so no handler can forget the
+check:
+
+```ts
+import { gated } from '@actvalue/azure-app-config';
+
+app.http('orders', {
+  methods: ['GET'],
+  handler: gated(CONFIG, async (request, context) => {
+    return { jsonBody: await listOrders() };    // runs only once the environment is written
+  }),
+});
+```
+
+While `hydrate(CONFIG)` rejects, the wrapper answers `{ status: 503, body: 'Service Unavailable' }`
+with a `Retry-After` in whole seconds — the time until the retry floor opens, margin included — and
+no `Retry-After` for a `ConfigInputError`, which waiting will not fix. It never rejects because of
+configuration, and logs nothing itself: `hydrate()` has already logged the attempt, once. The
+handler's own errors reach the host untouched. The response is a plain object that fits
+`HttpResponseInit`; the package does not depend on `@azure/functions`.
 
 **An `app.hook.appStart()` hook is an early start, never the guarantee.** On the v4 Node worker,
 `startApp()` first loads every entry-point file — which runs all module-scope code — and only then
@@ -166,28 +215,60 @@ app.hook.appStart(() => {
 });
 ```
 
-**Inside the retry floor, wait — never a bare rethrow.** After a failed attempt, every call for
-`retryFloorMs` rejects with a `ConfigFloorError` and sends nothing to the store. A handler that
-rethrows it abandons the message, Service Bus redelivers it at once, and every redelivery fails the
-same way within milliseconds: `maxDeliveryCount` is spent in seconds, and every message a cold
-worker receives during a store failure is dead-lettered. Wait `retryAfterMs`, make one more
-attempt, and only then let the invocation fail:
+The `catch` only keeps the rejection handled: `hydrate()` has logged the failure itself.
+
+**With no single entry file, give the hook its own entry module.** Under the v4 model `main` can be
+a glob, and then every matched module is an entry point. Registering the hook in a module several
+handlers import works only because of module caching. Register it in one dedicated entry module
+that does nothing else, and keep `CONFIG` in a module with no side effects that every handler
+imports:
 
 ```ts
-import { ConfigFloorError, hydrate } from '@actvalue/azure-app-config';
+// package.json: "main": "dist/src/functions/*.js"
+
+// src/config.ts — no side effects; every handler imports CONFIG from here
+export const CONFIG = { keys: KEYS, logger: { log: (m: string) => console.warn(m), error: (m: string) => console.error(m) } };
+
+// src/functions/start.ts — an entry module that registers the hook and nothing else
+import { app } from '@azure/functions';
+import { hydrate } from '@actvalue/azure-app-config';
+import { CONFIG } from '../config';
+
+app.hook.appStart(() => {
+  void hydrate(CONFIG).catch(() => {});
+});
+```
+
+**On a message trigger, wait for the floor — never a bare rethrow.** After a failed attempt, every
+call for `retryFloorMs` rejects with a `ConfigFloorError` and sends nothing to the store. A handler
+that rethrows abandons the message, Service Bus redelivers it at once, and every redelivery fails
+the same way within milliseconds: `maxDeliveryCount` is spent in seconds, and every message a cold
+worker receives during a store failure is dead-lettered. Wait as long as `retryAfterMs(error)`
+says, make one more attempt, and only then let the invocation fail:
+
+```ts
+import { ConfigInputError, hydrate, retryAfterMs } from '@actvalue/azure-app-config';
 
 async function configured(): Promise<void> {
   try {
     await hydrate(CONFIG);
   } catch (error) {
-    if (!(error instanceof ConfigFloorError)) throw error;
-    await new Promise(resolve => setTimeout(resolve, error.retryAfterMs));
+    if (error instanceof ConfigInputError) throw error;   // waiting won't fix it
+    const wait = retryAfterMs(error) ?? 0;                // undefined here: the floor is open, go now
+    await new Promise(resolve => setTimeout(resolve, wait));
     await hydrate(CONFIG);    // one more attempt; if it fails, the message is retried
   }
 }
 ```
 
-Waiting exactly `retryAfterMs` is enough. It is the time until the floor opens rounded up, plus a
+`retryAfterMs(error)` covers both rejections: a `ConfigFloorError`'s own `retryAfterMs`, and for a
+fresh failure the time until the floor it armed opens. Its `undefined` means two things — don't
+retry, for a `ConfigInputError`; retry now, for anything else, when the floor is already open
+(`retryFloorMs: 0`, or a rejection that landed after `resetHydration()`) — so branch on
+`instanceof ConfigInputError`, not on `undefined`. Nothing to log here: `hydrate()` logged the
+failed attempt, and logs nothing for a floor rejection.
+
+Waiting exactly that long is enough. It is the time until the floor opens rounded up, plus a
 50 ms margin, so a timer that fires a millisecond early still lands outside the floor. The pattern
 assumes `retryFloorMs` sits well inside the invocation's timeout, as the 30 s default does; a
 handler cannot wait out a floor longer than its invocation. Invocations
@@ -197,16 +278,17 @@ that wake together and ask for the same keys share one attempt. The default floo
 **What the floor allows.** For `hydrate()` callers on message triggers the floor is the only
 limit: at most one attempt per floor window per process. At the 30 s default that is up to 2,880
 attempts a day per process while a failure persists and messages keep arriving — each costing
-what its kind of failure costs (above), so a 403 alone can pass a Free store's 1,000 from one
-process, and a failure after a full read costs a request per key. A Functions app on a Free store
-should weigh that against its instance count, and its key count, when it chooses `retryFloorMs`.
+what its kind of failure costs (above), so on a capped store a 403 alone can use up the day's
+quota from one process, and a failure after a full read costs a request per key. A Functions app on
+a capped store should weigh that against its instance count, its key count and its worker churn
+when it chooses `retryFloorMs`, and read [the store's quota](#the-stores-quota) first.
 
 **`hydrateWithBackoff` does not belong inside an invocation.** It returns only once the store
 answers, which can be long after the invocation's own timeout.
 
 **Report configuration health without spending quota.** A health endpoint that calls `hydrate()`
 may start a store attempt whenever the floor opens. Pings arriving on several instances then spend
-a Free store's daily requests during a persistent outage: within hours for a refused read, and
+a capped store's daily quota during a persistent outage: within hours for a refused read, and
 faster for a failure after a full read, which costs one request per key. `hydrationStatus()` reads
 what `hydrate()` has done and never makes a request:
 
@@ -229,10 +311,10 @@ app.http('health', {
 `none` and `pending` are normal here: nothing is loaded until a handler or the hook asks.
 
 **The logger is per attempt, not per call.** An attempt logs through the `logger` of the call that
-started it; a call that joins it in flight, or is handed the memoised success, logs nothing through
-its own. So a per-invocation logger such as `InvocationContext` records the success line in
-whichever invocation happened to be first. Pass a process-level logger, such as `CONFIG`'s above,
-if that matters.
+started it — its success line, or its one failure line; a call that joins it in flight, or is
+handed the memoised success, logs nothing through its own. So a per-invocation logger such as
+`InvocationContext` records those lines in whichever invocation happened to be first. Pass a
+process-level logger, such as `CONFIG`'s above, if that matters.
 
 ## Precedence: who wins when a variable is already set
 
@@ -266,6 +348,12 @@ With the option passed, the line states the decision it produced: a JavaScript c
 string `"false"`, which is truthy, gets local-wins and `localOverridesWin option true`. `null` is
 treated as not passed. The line names variables, never values. When something was kept, a second
 line, `Kept from the local environment: …`, names those.
+
+**Local precedence still reads the store.** With local precedence on and every mapped variable
+already set locally, `hydrate()` still makes its request, and fails if the store cannot be read.
+That is deliberate: the request also checks that the store exists and that this identity holds the
+grants the deployed application will need, which is what a local run is for. A developer needs
+`az login` — or, for a run with no identity to borrow, `APP_CONFIG_CONNECTION_STRING`.
 
 `NODE_ENV` plays no part. In a Functions app it is an ordinary per-slot app setting that often
 means something else, and a staging slot carrying `development` would let leftover settings beat
@@ -308,7 +396,7 @@ store.
 | `timeoutMs` | `15_000` | Provider startup timeout. Finite, above 0, at most 2^31-1 |
 | `retryFloorMs` | `DEFAULT_RETRY_FLOOR_MS` (`30_000`) | Minimum gap between attempts after a failure. Finite, 0 or more — NaN would switch it off |
 | `localOverridesWin` | `!process.env.WEBSITE_INSTANCE_ID`, read on every attempt | Dev-only. Hosts other than App Service and Functions pass `false` |
-| `logger` | `console` | Per attempt: the call that starts an attempt logs it |
+| `logger` | `console` | Per attempt: the call that starts an attempt logs it. `log` gets the success line, `error` (else `log`) a failure |
 
 Returns `{ label, applied, kept, loadedAt }` — which variables were written, which were left
 alone, and when (milliseconds since the epoch). Throws `ConfigLoadError` if the store cannot be
@@ -324,6 +412,26 @@ leaves it alone.
 
 A success is memoised against the `keys`/`label` pair it was made with, not globally: one worker
 process hosting several functions must not hand the second one the first one's result.
+
+Concurrent calls for the same `keys`/`label` pair share one attempt, and when it fails **every one
+of them receives the identical rejection object**.
+
+**A failure is logged once, by the attempt.** A failed attempt writes one line through
+`logger.error` — `logger.log` if the logger has no `error` — of the call that started it:
+
+```
+Configuration load failed: <the error's message>
+```
+
+The message names the store, the label, the keys or the cause; never a value. Callers that join
+the attempt, memo hits and `ConfigFloorError` rejections log nothing, so a caller does not log the
+rejection again. A call rejected before any request — no endpoint, no label, a filter character, a
+timing option that is not a usable number, or input the provider refuses before its first request
+— is not an attempt, but it is logged the same way the first time its message is seen, and not
+again until `resetHydration()`. Build one options object and reuse it: every distinct message is
+logged, and remembered until the reset. A logger that throws
+changes nothing: the call rejects with the same error it would have. Attempts that
+`hydrateWithBackoff` starts are reported by its `onError` instead.
 
 ### `hydrateWithBackoff(options, backoff?): Promise<HydrationResult>`
 
@@ -341,6 +449,40 @@ schedule. After a real failure, `onError`'s `nextDelayMs` and the default "retry
 when the next attempt will really happen: the backoff delay, or the time until the floor opens if
 that is longer. `initialMs` and `maxMs` must be finite and above 0. A wait longer than
 `setTimeout` honours (about 24.8 days) is slept in steps, so a huge floor cannot spin the loop. **Long-lived processes only** — never inside a function invocation.
+
+Its failures are reported by `onError` alone: the default logs `Configuration load failed,
+retrying in <seconds>s: <message>` once per failure, and a custom `onError` replaces that line.
+The attempts the loop starts do not also log `hydrate()`'s failure line, and neither does the
+`ConfigInputError` it rethrows.
+
+### `gated(options, handler)`
+
+Wraps an HTTP handler: `(...args) => Promise<handler's result | ConfigUnavailableResponse>`. Each
+call awaits `hydrate(options)`, then calls `handler` with the original arguments and returns its
+result; the handler's own errors propagate untouched. When `hydrate()` rejects it returns
+`{ status: 503, body: 'Service Unavailable' }`, plus `headers: { 'Retry-After': '<seconds>' }` —
+`Math.max(1, Math.ceil(retryAfterMs(error) / 1000))` — whenever `retryAfterMs(error)` gives a wait.
+It never rejects because of configuration and logs nothing itself. See the Functions section.
+
+### `retryAfterMs(error): number | undefined`
+
+How long to wait after any rejection from `hydrate()` before calling it again, in milliseconds.
+Makes no request.
+
+| `error` | Returns |
+|---|---|
+| `ConfigFloorError` | Its `retryAfterMs` |
+| `ConfigInputError`, whether or not it reached the store | `undefined` — waiting won't fix it |
+| Anything else | The time until the armed retry floor opens, by the `retryFloorMs` of the attempt that armed it, rounded up, plus the 50 ms margin; `undefined` if the floor is already open — retry now |
+
+So `undefined` means "don't retry" for a `ConfigInputError` and "retry now" for anything else: tell
+them apart with `instanceof ConfigInputError`.
+
+### `ConfigUnavailableResponse`
+
+`{ status: 503; body: string; headers?: Record<string, string> }`, what `gated()` answers.
+Structural: it is assignable to an Azure Functions `HttpResponseInit`, without a dependency on
+`@azure/functions`.
 
 ### `hydrationStatus(keys, label?): HydrationStatus`
 
@@ -399,7 +541,71 @@ found reaches the provider's post-read input-error path — so it is there for a
 
 ### `resetHydration()`
 
-Clears the memoised results, the recorded failures and the retry floor. For tests.
+Clears the memoised results, the recorded failures, the retry floor and the set of pre-request
+errors already logged. For tests.
+
+**One state per version, shared by both builds.** The package ships an ESM and a CJS build, and a
+process can load both. They share one state — one memo, one retry floor — kept on `globalThis`
+under a symbol that carries the exact package version, and `resetHydration()` from either clears
+it for both. The error classes' brands carry no version, so `instanceof` matches an instance from
+either build of any version of the package; the state is shared only by the two builds of one
+exact version. Two *different* versions in one process therefore keep separate state: each version
+has its own floor.
+
+## Testing a consumer
+
+To run your tests against the real package with only the provider's `load()` replaced, make your
+test runner process the package itself. For vitest:
+
+```ts
+// vitest.config.mts
+import { defineConfig } from 'vitest/config';
+
+export default defineConfig({
+  test: {
+    server: { deps: { inline: ['@actvalue/azure-app-config'] } },
+  },
+});
+```
+
+Without it, vitest hands the package to Node untransformed, and `vi.mock` of the provider never
+reaches the package's own import of it: your tests would call the real `load()`. Then mock
+`load()`, which needs to resolve to an object with a `get(key)`, and reset both the package and
+the variables it writes between tests:
+
+```ts
+import { beforeEach, it, vi } from 'vitest';
+import { load } from '@azure/app-configuration-provider';
+import { resetHydration } from '@actvalue/azure-app-config';
+
+vi.mock('@azure/app-configuration-provider', () => ({ load: vi.fn() }));
+
+const KEYS = { 'shared:mongoUrl': 'MONGO_URL' };
+
+beforeEach(() => {
+  resetHydration();
+  vi.mocked(load).mockReset();
+  for (const variable of Object.values(KEYS)) delete process.env[variable];
+  process.env.APP_CONFIG_ENDPOINT = 'https://example.invalid';
+  process.env.APP_CONFIG_LABEL = 'test';
+});
+
+it('serves once configuration is loaded', async () => {
+  const values: Record<string, string> = { 'shared:mongoUrl': 'mongodb://example.invalid/app' };
+  vi.mocked(load).mockResolvedValue({ get: (key: string) => values[key] } as never);
+  // … call the handler
+});
+```
+
+**Re-importing the package no longer gives fresh state; call `resetHydration()` in `beforeEach`.**
+The state is shared across module instances (above), so `vi.resetModules()`,
+`jest.resetModules()` or `jest.isolateModules()` followed by a fresh import hands back the same
+memo and floor. It does not leak between test files: Jest, and vitest with its default isolation,
+give each file its own global scope.
+
+**Clear the mapped variables too.** A test runner sets no `WEBSITE_INSTANCE_ID`, so local
+precedence is on, and a value one test's `hydrate()` wrote into `process.env` would beat the next
+test's fake store — delete them (or snapshot and restore `process.env`) beside `resetHydration()`.
 
 ## Development
 

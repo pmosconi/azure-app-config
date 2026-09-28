@@ -24,8 +24,9 @@ import type { CredentialEvidence, FailureObservation } from './interface';
  * provider throws away is observed on the way past, at the cost of no extra request.
  *
  * The alternative was a second, direct `getConfigurationSetting` call after a failure to find out
- * what the first one hit. That spends another request against a store whose Free SKU allows 1,000
- * a day — the very budget invariant 2 exists to protect — and it reports the outcome of a
+ * what the first one hit. That spends another request against a capped store's daily quota — on
+ * a Free store observed nearer 250–400 requests than 1,000, since the meter charges several units
+ * per request — the very budget invariant 2 exists to protect, and it reports the outcome of a
  * different request, which need not be the one that failed.
  */
 

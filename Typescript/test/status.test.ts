@@ -2,8 +2,8 @@
  * hydrationStatus — configuration health without spending the quota.
  *
  * A health endpoint that calls hydrate() to learn whether configuration loaded may start a store
- * attempt on every ping. On a Free store (1,000 requests a day), pings from a few instances during
- * a failure that persists spend the day's quota in about an hour, and no finite floor fixes that.
+ * attempt on every ping. On a capped store, pings from a few instances during a failure that
+ * persists spend the day's quota within hours, and no finite floor fixes that.
  * So the status is a read of the bookkeeping and nothing else: every test here asserts that
  * `load()` was not called by it, in every state, including before any attempt and while one is in
  * flight.
