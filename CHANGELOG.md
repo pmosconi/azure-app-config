@@ -1,10 +1,82 @@
 # Changelog
 
 Changes to `@actvalue/azure-app-config`. Until `1.0.0` a minor version may break things; each
-release says what, and which consumer workarounds it lets you delete. The Python half, when it is
-written, matches every behaviour listed here (see the parity rule in `CLAUDE.md`).
+release says what, and which consumer workarounds it lets you delete. The Python half,
+`actvalue.azure-app-config`, matches every behaviour listed here (see the parity rule in
+`CLAUDE.md`) except where its own entry says otherwise.
 
-## 0.3.0 - unreleased
+## Python 0.3.0 - released 2026-09-29
+
+The first release of the Python half, `actvalue.azure-app-config` on PyPI, import package
+`azure_app_config`, Python 3.11 or later, on `azure-appconfiguration-provider` 2.5 (`>=2.5.0,<3`)
+and `azure-identity`. It matches TypeScript `0.3.0`: the same option names in snake_case, the same
+defaults and error semantics, the same four invariants, and the same success and failure lines.
+It has not yet run under a consumer; `1.0.0` follows an API review across both halves.
+
+### Added
+
+- `hydrate(options)`, synchronous and thread-safe: one state behind one lock, one attempt in
+  flight per key map and label, and callers in other threads joining it and receiving the
+  identical exception object. `hydrate_async(options)` runs it through `asyncio.to_thread`,
+  sharing the memo, the floor and the in-flight attempt.
+- `hydrate_with_backoff(options, backoff=None)` with `BackoffOptions(initial_ms, max_ms,
+  on_error)`; `hydration_status(keys, label=None)`; `retry_after_ms(error)`; `reset_hydration()`;
+  `DEFAULT_RETRY_FLOOR_MS`; `ConfigLoadError` (`detail`, `status_code`, `observations`),
+  `ConfigInputError` (`reached_store`), `ConfigFloorError` (`retry_after_ms`); `HydrateOptions`,
+  `HydrationResult`, `HydrationStatus`, `FailureObservation`, `Logger`, `KeyMap`. The cause is
+  `__cause__` on all three errors.
+- The logger defaults to `logging.getLogger("azure_app_config")` — not under `azure.`, which
+  consumers commonly silence below WARNING. The success line goes through `info`, the failure line
+  through `error` (else `info`).
+
+### Where it differs from TypeScript 0.3.0, and why
+
+- **No `gated()`.** No Python consumer has HTTP triggers yet; it is added, additively, with the
+  first one. `retry_after_ms()` and the failure line, which it is built on, are here.
+- **No dual-build registry and no error brands.** A Python process imports a module once, so there
+  is one state and one set of classes by construction.
+- **No async `hydrate_with_backoff`.** `asyncio.to_thread(hydrate_with_backoff, options)` for a
+  process that wants one, knowing cancellation does not stop the thread.
+- **`timeout_ms` bounds the call itself.** Provider 2.5.0 checks its startup timeout only between
+  passes, so a hanging request would hold `load()` indefinitely; the load runs on a daemon thread,
+  the call raises when the bound fires, and the abandoned thread can never write the environment.
+  Below 5 000 ms a provider failure padded to five seconds arrives after the bound and is reported
+  from the wire evidence instead.
+- **No SDK retries on the store or the vault clients** (`retry_total=0`), and connection and read
+  timeouts of twice `timeout_ms`. **A trade, not a saving.** A single transient 5xx or 429 now
+  fails the attempt: at the defaults after about 10 s (the provider benches its only client for
+  30 s, then waits out its startup timeout), arming the 30 s floor, so a consumer goes about 40 s
+  without configuration where the TypeScript half's SDK retries would usually absorb the blip
+  inside the attempt. What it buys: one request per failure rather than three, and an abandoned
+  load thread that ends — azure-core sleeps a `Retry-After` uncapped before re-checking its own
+  timeout, and not retrying is the only bound. The README states what ends an abandoned thread and
+  what does not.
+- **An input error is refused before any network activity, by definition.** A `ValueError` or
+  `TypeError` after a token was asked for or a request was sent is a `ConfigLoadError`: transient
+  failures arrive that way (a non-JSON identity-endpoint body, a response that does not
+  deserialize). So a Key Vault reference provider 2.5.0 cannot parse — which it raises at once
+  after the read, where the JavaScript provider retries until its timeout — is a retryable
+  `ConfigLoadError` here too, and `reached_store` is always `False`. The reference's stored URI,
+  which the provider echoes into its message, is withheld.
+- **One `DefaultAzureCredential` per process**, reused across attempts and dropped (not closed)
+  by `reset_hydration()`, so an attempt still using it keeps working; the TypeScript half builds
+  one per attempt.
+- **A missing key raises `LookupError`**, the counterpart of the TypeScript plain `Error`.
+- **The success line cannot turn a success into a failure.** A logger that raises on it is
+  swallowed: the environment is already written, and a raise would report a failure that changed
+  it.
+- **Refused before any request, in addition:** an empty store key (the SDK sends it as `key=`),
+  and a variable name the environment cannot hold (empty, `=` or NUL). A value holding NUL is
+  reported with the missing keys.
+
+### Documentation
+
+- `WEBSITE_INSTANCE_ID` is verified on App Service and Functions Premium/Elastic Premium and
+  unverified on Flex Consumption and Linux Consumption: pass `local_overrides_win` explicitly
+  there until the success line's mode confirms the signal. The same note is in the root README
+  for the TypeScript half.
+
+## 0.3.0 - released 2026-09-28
 
 What the third and fourth consumers found on `0.2.1` — two Functions apps with HTTP triggers only,
 which answer a failed load with an immediate 503 — plus the two items deferred to `1.0.0`, now

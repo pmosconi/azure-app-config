@@ -1,4 +1,4 @@
-.PHONY: help install-ts install-py test-ts test-integration-ts test-py lint-ts lint-py typecheck-ts typecheck-py format-py build-ts build-py publish-ts publish-py publish-py-test pack-ts clean venv-py install test lint
+.PHONY: help install-ts install-py test-ts test-integration-ts test-py test-integration-py lint-ts lint-py typecheck-ts typecheck-py format-py build-ts build-py publish-ts publish-py publish-py-test pack-ts clean venv-py install test lint
 
 help:
 	@echo "Available commands:"
@@ -8,6 +8,7 @@ help:
 	@echo "  make test-ts            - Run TypeScript unit tests"
 	@echo "  make test-integration-ts - Run TypeScript tests against the real provider (no Azure needed)"
 	@echo "  make test-py            - Run Python unit tests"
+	@echo "  make test-integration-py - Run Python tests against the real provider (no Azure needed)"
 	@echo "  make test               - Run all tests"
 	@echo "  make lint-ts            - Lint TypeScript code"
 	@echo "  make lint-py            - Lint Python code"
@@ -52,8 +53,7 @@ publish-ts:
 	npm login
 	cd Typescript && npm publish
 
-# Python commands — the half is not written yet; the targets are here so the
-# shape matches and nothing has to be invented when it is.
+# Python commands
 install-py:
 	@echo "Setting up Python environment with uv..."
 	cd Python && uv sync --all-extras --all-groups
@@ -61,6 +61,13 @@ install-py:
 
 test-py:
 	cd Python && uv run pytest -m unit
+
+# Drives the real azure-appconfiguration-provider against a reserved .invalid endpoint and a
+# loopback fake store: that per_retry_policies still reaches its clients, and that the error shapes
+# the unit fixtures claim are the ones it raises. No Azure, no credentials, no egress — but the
+# provider pads a startup failure to five seconds, so it is slow.
+test-integration-py:
+	cd Python && uv run pytest -m integration
 
 lint-py:
 	cd Python && uv run ruff check src tests

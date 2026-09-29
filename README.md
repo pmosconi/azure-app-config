@@ -8,13 +8,15 @@ npm + PyPI package.
 
 ```bash
 npm install @actvalue/azure-app-config       # TypeScript
-pip install actvalue.azure-app-config        # Python — not yet written
+pip install actvalue.azure-app-config        # Python — see Python/README.md
 ```
 
 > **Status: pre-1.0.** The TypeScript half is on npm and runs in production in four consumers:
 > three Azure Functions apps and a container web app on App Service. `0.3.0` is the candidate for
-> its frozen API: `1.0.0` adds the Python half and republishes the TypeScript half without a
-> behaviour change. Until then a minor version may break things;
+> its frozen API. The Python half is written as `0.3.0`, matching it except for `gated()` (see
+> [`Python/README.md`](Python/README.md)), and awaits its first consumer. `1.0.0` follows an API
+> review across both halves, and republishes the TypeScript half without a behaviour change.
+> Until then a minor version may break things;
 > [`CHANGELOG.md`](CHANGELOG.md) says what, and which workarounds each release lets you delete.
 
 ## What it does
@@ -333,6 +335,12 @@ deployed environment, true locally. Its default is "not deployed", read on every
 Kubernetes, a VM — injects nothing this reads, so pass `localOverridesWin: false` there**, or the
 local environment beats the store.
 
+The signal is verified on App Service and on Functions Premium/Elastic Premium. **On Flex
+Consumption and Linux Consumption it is unverified** — the host may leave it empty, which reads as
+a developer machine — so pass `localOverridesWin: false` (`local_overrides_win=False` in Python)
+explicitly there until it is confirmed. The success line's mode is how you confirm it:
+`(store wins: WEBSITE_INSTANCE_ID present)` from a deployed instance means the signal is there.
+
 The success line ends with which side won and why, on every successful attempt, whether or not
 anything was kept — so a missing signal shows up in the first log line, not as a stale value
 winning:
@@ -554,6 +562,9 @@ has its own floor.
 
 ## Testing a consumer
 
+This section is the TypeScript half's; the Python half's is in
+[`Python/README.md`](Python/README.md#testing-a-consumer).
+
 To run your tests against the real package with only the provider's `load()` replaced, make your
 test runner process the package itself. For vitest:
 
@@ -623,7 +634,11 @@ azure-app-config/
 │   ├── test/
 │   ├── package.json
 │   └── README.md
-├── Python/                  # to follow
+├── Python/
+│   ├── src/azure_app_config/
+│   ├── tests/
+│   ├── pyproject.toml
+│   └── README.md
 ├── CHANGELOG.md
 ├── Makefile
 └── README.md

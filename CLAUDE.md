@@ -28,6 +28,11 @@ make test-integration-ts  # real provider, no Azure — see below
 make lint-ts
 make build-ts         # tsup → dist/, esm + cjs + dts
 make publish-ts       # npm publish (prepublishOnly builds)
+make test-py          # pytest -m unit
+make test-integration-py  # real provider: .invalid endpoint + loopback fake store, no Azure
+make lint-py          # ruff check + format --check
+make typecheck-py     # mypy strict
+make build-py         # uv build → Python/dist/
 ```
 
 ## The four invariants
@@ -352,10 +357,97 @@ without a real reason recorded in the commit message.
   for a pre-request rejection, never for a joiner, a memo hit or a floor rejection, and never
   changing the outcome; joiners receiving the identical exception object; `hydrate_with_backoff`
   not double-logging; and a `gated` equivalent answering the same 503 and `Retry-After` for
-  whatever HTTP shape Python consumers use. The dual-build registry and the error brands have no
+  whatever HTTP shape Python consumers use — **not in Python `0.3.0`**: no Python consumer has
+  HTTP triggers yet, so it is a known additive gap, added with the first one. The dual-build registry and the error brands have no
   Python counterpart: a Python process imports a module once, so there is one state and one set
   of classes by construction — say so in the Python half rather than inventing a registry.
   `CHANGELOG.md` lists them.
+
+## Python-specific decisions
+
+The Python half runs on `azure-appconfiguration-provider` 2.5.0, which behaves differently from
+the JavaScript provider. `tests/helpers.py` records its shapes with source line numbers; the
+integration test checks them against the real provider.
+
+- **Sync core, async wrapper.** `hydrate()` is synchronous: one module-level state behind one
+  lock, joiners in other threads wait on the attempt's event and re-raise its exception object.
+  `hydrate_async` is `asyncio.to_thread(hydrate)`, so both share memo and floor. Consumers mix
+  sync handlers (the worker's thread pool) with async ones and call `hydrate` at module top.
+- **Every caller re-raises with the starter's traceback below the shared frame**
+  (`_Attempt.traceback`). A plain re-raise piles every joiner's frames and locals (a Service Bus
+  message) onto the one object, retained through `last_error` and the floor error. The limit, since
+  identity is the spec: the traceback of a shared failure may show another caller's frames; it
+  does not grow.
+- **Lines are logged after the attempt is settled** — result or error recorded, attempt cleared,
+  `done` set — still once, by the starter. A logging handler calling `hydrate()` on that thread
+  otherwise joins its own attempt and waits for ever. The default credential is built on the
+  calling thread, before the attempt is registered and outside `_lock`, because its constructor
+  logs through `azure.identity`; a `hydrate()` from a handler during that construction raises an
+  unlogged `ConfigLoadError` (a thread-local guard), since it cannot be given a credential and
+  logging would re-enter the handler. Only the provider's and SDK clients' loggers run on the load
+  thread; a handler there calling `hydrate()` waits until the bound: documented, not fixable here.
+- **`timeout_ms` bounds the call, on a daemon thread.** The provider checks `startup_timeout` only
+  between passes (`_azureappconfigurationprovider.py:240-246`), so a hanging request holds `load()`
+  for the transport's 300 s and more. `_run_bounded` waits `timeout_ms`; only the calling thread
+  writes `os.environ`, so a late load writes nothing, and a late provider is closed. Traffic is
+  counted at the bound. Below 5 000 ms the provider's five-second pad puts its error past the
+  bound: the wire evidence reports it instead. Accepted; the default is 15 s.
+- **What ends an abandoned load thread: `_client_limits`, on store and vault clients alike.**
+  `retry_total=0`, because azure-core sleeps a `Retry-After` uncapped before re-checking its
+  absolute `timeout` (`azure/core/pipeline/policies/_retry.py:453-470`, `:514-575`); no retry is
+  the only cap. The provider pops it for the store clients (`_azureappconfigurationprovider.py:86`)
+  and passes it per operation (`_utils.py:133-164`). `connection_timeout`/`read_timeout` at 2 × the
+  bound, so a request in flight at the bound is reported in flight, not raced by its own timeout.
+  The vault clients get the same through `keyvault_client_configs` as a mapping that answers every
+  vault URL (`_EveryVault`; the provider does `configs.get(vault_url, {})`,
+  `_key_vault/_secret_provider.py:48-56`). Worst case, every request answering just inside its
+  limits: (selectors + pages + 2 × references) × 4 × the bound. Unbounded by us: the credential's
+  own token calls, a server trickling bytes (read timeout is per read), the resolver, and the
+  provider's SRV replica discovery (`_discovery.py:81-90`). One request per selector per attempt,
+  since the provider backs its only client off for 30 s after a failure. **A trade, decided:** a
+  single transient 5xx or 429 fails the attempt (about 10 s at the defaults) and arms the 30 s
+  floor, about 40 s without configuration, where the TypeScript half's SDK retries would usually
+  absorb it; bought with it, one request per failure and an abandoned thread that ends.
+- **The provider keeps the cause; the chain wins, with provenance.** `_load_all` raises
+  `TimeoutError(msg, startup_exceptions)` carrying every `AzureError` (`:243-246`), so `detail`
+  unwraps it — but prefers the observations when they saw the same statuses (the store's own
+  words). A status in the chain the store's pipeline never saw, while it saw the store answer, is
+  stated as not the store's: Key Vault's `SecretClient` is the provider's only other client, and it
+  does not carry the policy.
+- **The policy sits above authentication** (`per_retry_policies` goes directly after
+  `RetryPolicy`, `azure/core/_pipeline_client.py:155-172`). A request waiting on a token is
+  counted in flight, so the credential check comes first in `_attribute_silence`: asked and never
+  answered means the request never reached the transport.
+- **The policy is a `SansIOHTTPPolicy`.** One instance goes to every client the provider builds;
+  `Pipeline` rewires an `HTTPPolicy` instance's `next` per pipeline (`azure/core/pipeline/_base.py:
+  170-176`), so with replicas the primary's requests would run down the last replica's chain. A
+  SansIO policy gets its own runner per pipeline and holds only the shared counts.
+- **An input error happens before any network activity, or it is not one.** A `ValueError`,
+  `TypeError` or `IndexError` from the provider is a `ConfigInputError` only when no token was
+  asked for and no request seen: the provider's argument checks. After that the same classes come
+  from failures waiting can fix — msal's `JSONDecodeError` on a non-JSON identity-endpoint body,
+  which `ManagedIdentityCredential` re-raises unwrapped; azure-core's `DeserializationError`; a
+  vault response that does not decode — and an input error stops `hydrate_with_backoff` and the
+  message-trigger recipe for good. So a Key Vault reference 2.5.0 cannot parse (raised at once
+  after the read) is a retryable `ConfigLoadError`, as the same defect is on TypeScript, and its
+  `detail` still names the reference. `reached_store` is always `False`: defensive, as in TS.
+- **One `DefaultAzureCredential` per process**, in the state, created on first need.
+  `reset_hydration()` drops it without closing it: an in-flight attempt or an abandoned thread may
+  still be using it, and closing it would fail them ("transport has already been closed"); the GC
+  collects it. Two threads racing to build it: the first installed wins, the loser is closed
+  unused. One per attempt would be up to 2,880 a day under a persistent failure, each with its own
+  session and an empty token cache. A caller's credential is never touched.
+- **A stored value the provider echoes is withheld.** `parse_key_vault_id` puts the reference URI
+  in its message (`azure/keyvault/secrets/_shared/__init__.py:50-57`); a mistyped reference can
+  be the secret itself.
+- **The success line is guarded too.** The environment is written before it; a raising logger
+  there would report a failure that changed the environment. The TypeScript half does not guard
+  `logger.log` on success — a gap for the API review.
+- **Refused before any request, beyond TypeScript:** an empty key (the SDK sends `key=`, a filter
+  nobody has verified), a variable name `os.environ` cannot hold. A NUL in a value is unusable, and
+  `_write_all` restores what it wrote if a write still fails.
+- **A missing key raises `LookupError`**, the plain-`Error` counterpart; the cause is `__cause__`
+  on all three error classes; timestamps are `int` milliseconds; results hold tuples.
 
 ## Status
 
@@ -378,6 +470,10 @@ without a real reason recorded in the commit message.
 - [ ] `0.3.0` published, and the consumers' workarounds deleted (`CHANGELOG.md` lists them)
 - [ ] API review across both halves, then `1.0.0`: the Python half, and the TypeScript half
       republished without a behaviour change
+- [x] Python half written as `0.3.0` (unpublished): parity with TypeScript `0.3.0` except `gated`,
+      a known additive gap for the first Python HTTP consumer
+- [ ] Python `0.3.0` published and validated by its first consumer: a Functions app with Service
+      Bus and timer triggers
 - [ ] The Python half's own second consumer
 
 The second consumer's inlined copy of the hydrator is still part of the specification: read it

@@ -293,6 +293,86 @@ the third consumer's fail-fast shape.
 - **Not a code change:** the floor and the memo behaved as designed. The per-process floor doesn't
   bound the load count across worker starts, and nothing in-process can.
 
+## Found by the third consumer, on `0.3.0`
+
+The third consumer moved from `0.2.1` to `0.3.0`. Its gate became `gated(CONFIG, handler)` with no
+change in behaviour, and no library change was needed. These items are for `1.0.0`.
+
+### 20. README: mocking the exported `hydrate` does not reach `gated()`
+
+**Priority: low. Docs only.**
+
+- **Now:** `gated()` calls the package's internal `hydrate`, so a consumer test that replaces the
+  exported `hydrate` with a mock does not change what the gate does. The consumer's old tests used
+  that approach and had to be rewritten to mock the provider's `load()`.
+- **Proposal:** add one sentence to "Testing a consumer": mock the provider's `load()`, not
+  `hydrate`, because `gated()` does not go through the export.
+
+### 21. `retryAfterMs` for a floor rejection whose cause is an input error
+
+**Priority: low. Decide for `1.0.0`. Unreachable from store data on provider 2.6.0.**
+
+- **Now:** a `ConfigInputError` with `reachedStore: true` gives `retryAfterMs` → `undefined`, so
+  `gated()` sends no `Retry-After`. Every call inside the floor it armed is a `ConfigFloorError`
+  with that error as `cause`, and gets a wait of about 31 s, although waiting alone will not fix
+  it. The behaviour is the same as in `0.2.1`, and a consumer test now pins it.
+- **Options:**
+  - return `undefined` when a floor error's `cause` is a `ConfigInputError`;
+  - or keep the wait and document why: a fix in the store heals the next attempt, and the floor
+    is the right pace for it.
+
+## Found writing the Python half, for the `1.0.0` API review
+
+The Python half was written against the TypeScript `0.3.0` spec on provider
+`azure-appconfiguration-provider` 2.5.0, whose behaviour differs from the JS provider's. Its
+CHANGELOG entry lists every deliberate difference. These items need a decision across both halves
+before `1.0.0` freezes them.
+
+### 22. TypeScript: a logger that throws on the success line breaks all-or-nothing
+
+**Priority: medium. Decide for `1.0.0`.**
+
+- **Now:** TypeScript guards the failure line against a throwing logger but not the success line.
+  A `logger.log` that throws after the environment was written makes `hydrate()` reject, although
+  the environment has changed. The Python half guards both.
+- **Proposal:** guard the success line the same way in TypeScript; a patch, no API change.
+
+### 23. Empty keys and unusable variable names
+
+**Priority: low. Decide for `1.0.0`.**
+
+- **Now:** the Python half refuses, before any request, an empty store key, variable names that
+  are empty or contain `=` or NUL, and a value containing NUL. TypeScript does not. The SDK sends
+  an empty key as `key=`, and what the store does with that is unverified.
+- **Options:** add the same checks to TypeScript, or drop them from Python. Either way the halves
+  should agree.
+
+### 24. SDK retries: TypeScript retries inside an attempt, Python does not
+
+**Priority: medium. Decide for `1.0.0`.**
+
+- **Now:** Python sets `retry_total=0` with per-request timeouts at twice `timeout_ms`, on store and
+  Key Vault clients, because azure-core sleeps a `Retry-After` uncapped and an abandoned load thread
+  would otherwise outlive the bound. The cost: a single transient 5xx or 429 fails the attempt
+  (about 10 s at the defaults) and arms the floor, about 40 s without configuration. TypeScript's
+  SDK retries usually absorb such a blip, at up to three requests per failure.
+- **Options:** keep the difference and document it (current); or find a way to cap `Retry-After`
+  in Python and allow one retry; or align TypeScript to no retries.
+
+### 25. Shape differences to confirm or align
+
+**Priority: low. Decide for `1.0.0`.**
+
+- The error cause is `__cause__` in Python and `cause` in TypeScript.
+- A missing key is a `LookupError` in Python and a plain `Error` in TypeScript.
+- Python keeps one default credential per process, dropped (not closed) by `reset_hydration()`;
+  TypeScript builds one per attempt.
+- Python's `timeout_ms` is a hard bound on the call; TypeScript returns at the later of the timeout
+  and the provider's five-second pad.
+- A re-entrant `hydrate()` on the thread constructing the default credential raises an unlogged
+  `ConfigLoadError` in Python; TypeScript has no counterpart.
+- `gated()` exists only in TypeScript until a Python HTTP consumer appears (decided).
+
 ## Already open
 
 - ESM/CJS dual state (CLAUDE.md, **Status**, deferred to `1.0.0`). The first consumer is CJS-only and adds nothing new.
