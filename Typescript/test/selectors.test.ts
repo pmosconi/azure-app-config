@@ -8,7 +8,7 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 import { load } from '@azure/app-configuration-provider';
 import { ConfigInputError, hydrate, hydrationStatus, resetHydration } from '../src/index';
-import { KEYS, fakeStore, restoreEnv, snapshotEnv } from './helpers';
+import { KEYS, VALUES, fakeStore, restoreEnv, snapshotEnv } from './helpers';
 
 vi.mock('@azure/app-configuration-provider', () => ({ load: vi.fn() }));
 vi.mock('@azure/identity', () => ({
@@ -170,5 +170,74 @@ describe('selectors', () => {
     await expect(hydrate({ keys: {}, retryFloorMs: 0 })).rejects.toThrow(/no keys/);
 
     expect(loadMock).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * 1.0.0, BACKLOG.md item 23 — the Python half's checks, now in both halves. Node drops
+ * `process.env['']` and `process.env['A=B']` without a word and truncates a value at NUL, so a
+ * variable would be reported as applied when it was not. Refused before any request: no load, no
+ * floor, and `hydrationStatus()` agrees, because it shares the checks.
+ */
+describe('a key or a variable name the environment cannot hold', () => {
+  const refused: [string, Record<string, string>, string][] = [
+    ['an empty key', { '': 'EMPTY_KEY' }, 'An empty key is not a key: keys must be listed one by one'],
+    [
+      'an empty variable name',
+      { 'shared:mongoUrl': '' },
+      'Variable name "" for key "shared:mongoUrl" cannot be set in the environment',
+    ],
+    [
+      'a variable name with = in it',
+      { 'shared:mongoUrl': 'MONGO=URL' },
+      'Variable name "MONGO=URL" for key "shared:mongoUrl" cannot be set in the environment',
+    ],
+    [
+      'a variable name with NUL in it',
+      { 'shared:mongoUrl': 'MONGO\0URL' },
+      'Variable name "MONGO\0URL" for key "shared:mongoUrl" cannot be set in the environment',
+    ],
+  ];
+
+  it.each(refused)('refuses %s before any request, arming no floor', async (_name, keys, message) => {
+    loadMock.mockResolvedValue(fakeStore() as never);
+
+    const error = await hydrate({ keys, logger: { log: () => {}, error: () => {} } }).catch(
+      (e: unknown) => e
+    );
+
+    expect(error).toBeInstanceOf(ConfigInputError);
+    expect((error as ConfigInputError).message).toBe(message);
+    expect((error as ConfigInputError).reachedStore).toBe(false);
+    expect(loadMock).not.toHaveBeenCalled();
+    // No floor: a well-formed call right after it reaches the store.
+    await hydrate({ keys: KEYS, logger: { log: () => {} } });
+    expect(loadMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(refused)('refuses %s in hydrationStatus too', (_name, keys, message) => {
+    expect(() => hydrationStatus(keys)).toThrow(ConfigInputError);
+    expect(() => hydrationStatus(keys)).toThrow(message);
+    expect(loadMock).not.toHaveBeenCalled();
+  });
+
+  it('checks every entry, not only the first', async () => {
+    const error = await hydrate({ keys: { ...KEYS, 'myapp:other': 'A=B' }, logger: { log: () => {} } }).catch(
+      (e: unknown) => e
+    );
+
+    expect(error).toBeInstanceOf(ConfigInputError);
+    expect(loadMock).not.toHaveBeenCalled();
+  });
+
+  it('still allows = in a value, and in a key', async () => {
+    // The connection string's `Endpoint=sb://…;SharedAccessKey=k` is the ordinary case.
+    loadMock.mockResolvedValue(fakeStore({ ...VALUES, 'myapp:a=b': 'x=y' }) as never);
+
+    const result = await hydrate({ keys: { ...KEYS, 'myapp:a=b': 'A_EQUALS_B' }, logger: { log: () => {} } });
+
+    expect(result.applied).toContain('A_EQUALS_B');
+    expect(process.env.SERVICE_BUS_CONNECTION).toBe(VALUES['shared:serviceBus']);
+    expect(process.env.A_EQUALS_B).toBe('x=y');
   });
 });

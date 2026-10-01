@@ -15,8 +15,9 @@ neutral key names (`shared:mongoUrl`, `myapp:httpPort`). Anything specific to th
 extracted from belongs in that estate's private repository, not here.
 
 Order of work: TypeScript first, shaped against real consumers (three Functions apps and a
-container), frozen in `0.3.0`; then `1.0.0`, which adds the Python half and republishes the
-TypeScript half without a behaviour change. See **Status** below.
+container), its API settled in `0.3.0`; then the Python half as `0.3.0`; then `1.0.0`, which
+freezes the API of both halves after a review across them (`BACKLOG.md` items 20–27) and changes
+behaviour only where that review found a defect. See **Status** below.
 
 ## Commands
 
@@ -231,6 +232,18 @@ without a real reason recorded in the commit message.
   `timeoutMs` is capped at 2^31-1 because the provider hands it to `setTimeout` unstepped.
 - **Writes are all or nothing.** Every entry is checked before `process.env` is touched, with no
   await in between, so a rejection means the environment is as it was.
+- **What the environment cannot hold is refused — `1.0.0`, item 23, the Python half's checks.**
+  Node drops `process.env['']` and `process.env['A=B']` silently and truncates a value at NUL, so
+  each would be reported as applied. `planFor` refuses an empty key (the SDK would send `key=`)
+  and a variable name that is empty or contains `=` or NUL, before any request, arming no floor,
+  shared with `hydrationStatus()`; a value holding NUL is unusable, listed with the missing keys.
+  The messages are Python's, word for word.
+- **The success line is guarded — `1.0.0`, item 22.** It and the kept line are written after
+  `process.env`, so a throwing or rejecting `logger.log` there would report a failure that changed
+  the environment. Guarded as `reportFailure` is; a synchronous throw ends the lines, as in Python.
+  `options.logger` is read inside that guard, never before the load: a throwing getter read early
+  rejected a healthy load and armed the floor. The lines are still written inside the attempt,
+  before the memo is set (Python writes them after); kept, and in the parity table.
 - **The logger is per attempt, not per call.** The call that starts an attempt logs it — the
   success line through `log`, or since `0.3.0` the failure line through `error` (else `log`);
   joiners, memo hits and floor rejections log nothing. Documented rather than fixed: a
@@ -264,7 +277,9 @@ without a real reason recorded in the commit message.
   started logs nothing (it is a joiner); a loop joining an attempt a `hydrate()` call started gets
   that attempt's line and its own `onError` line — an accepted edge of mixing both in one process.
 - **`retryAfterMs(error)` — `0.3.0`, item 13 — replaces the consumers' hardcoded margin.** A
-  `ConfigFloorError`: its own. Any `ConfigInputError`: `undefined`, waiting won't fix it, even when
+  `ConfigFloorError`: its own — even when its `cause` is a `reachedStore: true` input error, which
+  waiting alone won't fix (kept in `1.0.0`, item 21: a fix in the store heals the next attempt,
+  and the floor is the right pace for it; documented in both READMEs and the JSDoc). Any `ConfigInputError`: `undefined`, waiting won't fix it, even when
   it armed the floor. Anything else: the floor armed now, by `state.floorMs` (as
   `hydrationStatus` measures it), ceil'd, plus `FLOOR_MARGIN_MS`; `undefined` if open, meaning
   retry now. So `undefined` has two meanings, and callers branch on `instanceof
@@ -318,6 +333,10 @@ without a real reason recorded in the commit message.
   ones allowed, and the wire evidence reported as facts and candidates, counted at the timeout.
   And from `0.2.1`: the success line's precedence mode in all four cases (signal present or
   absent, option true or false), the string `"false"` and `null`, and the `0.2.0` prefix intact.
+  And from `1.0.0`: a throwing and a rejecting `log` on the success and the kept line leaving the
+  call resolved, the environment written and the memo set; each refused name and the empty key
+  rejected before any request with no floor, in `hydrationStatus()` too; a NUL value listed with
+  the missing keys and nothing written; `=` in a value still fine.
   And from `0.3.0`: the failure line once per attempt, through `error` with the `log` fallback,
   and none for joiners, memo hits or floor rejections; joiners receiving the identical rejection;
   a pre-request rejection logged once per message and again after a reset, the provider's own
@@ -340,8 +359,9 @@ without a real reason recorded in the commit message.
   (`test/*.integration.test.ts`, its own config, excluded from `npm test`) runs the real `load()`
   against an RFC 2606 `.invalid` endpoint and asserts at least one observation. It needs no
   Azure, credentials or egress.
-- Public API stays small and additive. Pre-1.0 it can change; after 1.0 a change to any of the
-  four invariants is a major.
+- Public API stays small and additive. **Frozen at `1.0.0`**, both halves: an addition is a minor;
+  a change to any of the four invariants, or to a signature, is a major. Item 26 (a message-trigger
+  helper) is the first candidate for `1.1.0`.
 - Keep the two implementations behaviourally identical. Same option names in snake_case, same
   defaults, same error semantics. A divergence is a bug in whichever half moved. **Every 0.2.0
   behaviour is part of the spec the Python half must match** — `ConfigFloorError` with
@@ -357,11 +377,12 @@ without a real reason recorded in the commit message.
   for a pre-request rejection, never for a joiner, a memo hit or a floor rejection, and never
   changing the outcome; joiners receiving the identical exception object; `hydrate_with_backoff`
   not double-logging; and a `gated` equivalent answering the same 503 and `Retry-After` for
-  whatever HTTP shape Python consumers use — **not in Python `0.3.0`**: no Python consumer has
+  whatever HTTP shape Python consumers use — **not in Python `1.0.0`**: no Python consumer has
   HTTP triggers yet, so it is a known additive gap, added with the first one. The dual-build registry and the error brands have no
   Python counterpart: a Python process imports a module once, so there is one state and one set
   of classes by construction — say so in the Python half rather than inventing a registry.
-  `CHANGELOG.md` lists them.
+  **Every kept difference is in one table**, "Differences between the halves" in
+  `Python/README.md` (reviewed for `1.0.0`, items 24–25); a new one goes there, with its reason.
 
 ## Python-specific decisions
 
@@ -371,8 +392,28 @@ integration test checks them against the real provider.
 
 - **Sync core, async wrapper.** `hydrate()` is synchronous: one module-level state behind one
   lock, joiners in other threads wait on the attempt's event and re-raise its exception object.
-  `hydrate_async` is `asyncio.to_thread(hydrate)`, so both share memo and floor. Consumers mix
-  sync handlers (the worker's thread pool) with async ones and call `hydrate` at module top.
+  `hydrate_async` runs the same `_hydrate_once` through `asyncio.to_thread`, so both share memo
+  and floor. Consumers mix sync handlers (the worker's thread pool) with async ones and call
+  `hydrate` at module top.
+- **`hydrate_async` writes its lines on the event loop — `1.0.0`, `BACKLOG.md` item 27.** The
+  Functions Python worker drops a record written on a pool thread (seen in production: an async
+  handler's success line never arrived). `_hydrate_once` decides the lines exactly as before —
+  after the attempt settles and the memo is set, the once-per-message claim made on the calling
+  thread — and hands each to a sink its caller passes. `hydrate()` and `hydrate_with_backoff` pass
+  `_write_now`, so the line is written where it is decided, before a failure is raised;
+  `_hydrate_for_async` passes `pending.append` and hands the list to `_Handoff`, and the loop
+  writes it after the `await`. **A sink, not a list the sync caller writes in a `finally`:** that
+  was tried and made `test_joiners_do_not_pile_their_frames…` flaky (about 1 run in 10). Joiners
+  re-raise one shared object, each frame unwound adds to its traceback, and any bytecode between
+  the raise and the caller's `except` lets the GIL switch mid-unwind and interleave their frames.
+  With nothing on the way out, 0 in 200 on 3.11 and 3.13. Cancelled while still queued for a
+  worker, the call never runs: nothing attempted, written or claimed.
+  **Cancelled:** `collect()` in the coroutine's `finally` writes them on the loop if the call had
+  already returned; otherwise it marks the handoff and the worker writes them as it returns. One
+  lock, so each line is written once either way. Chosen over dropping it: a line the Functions host
+  may lose beats one lost on every host, and the attempt did spend quota. **A logger must not start
+  a load:** from a `hydrate_async` line it runs on the event loop, so a sync `hydrate()` that is
+  not a memo hit or a floor rejection blocks the loop for up to `timeout_ms`. Documented.
 - **Every caller re-raises with the starter's traceback below the shared frame**
   (`_Attempt.traceback`). A plain re-raise piles every joiner's frames and locals (a Service Bus
   message) onto the one object, retained through `last_error` and the floor error. The limit, since
@@ -441,11 +482,11 @@ integration test checks them against the real provider.
   in its message (`azure/keyvault/secrets/_shared/__init__.py:50-57`); a mistyped reference can
   be the secret itself.
 - **The success line is guarded too.** The environment is written before it; a raising logger
-  there would report a failure that changed the environment. The TypeScript half does not guard
-  `logger.log` on success — a gap for the API review.
-- **Refused before any request, beyond TypeScript:** an empty key (the SDK sends `key=`, a filter
-  nobody has verified), a variable name `os.environ` cannot hold. A NUL in a value is unusable, and
-  `_write_all` restores what it wrote if a write still fails.
+  there would report a failure that changed the environment. The TypeScript half guards it too
+  since `1.0.0` (item 22).
+- **Refused before any request, in both halves since `1.0.0` (item 23):** an empty key (the SDK
+  sends `key=`, a filter nobody has verified), a variable name `os.environ` cannot hold. A NUL in a
+  value is unusable, and `_write_all` restores what it wrote if a write still fails.
 - **A missing key raises `LookupError`**, the plain-`Error` counterpart; the cause is `__cause__`
   on all three error classes; timestamps are `int` milliseconds; results hold tuples.
 
@@ -467,13 +508,17 @@ integration test checks them against the real provider.
 - [x] `0.3.0`: items 12–19 shipped or decided, and both items once deferred to `1.0.0` settled —
       the dual-build state (a version-keyed `globalThis` registry) and starvation across key maps
       (global floor, documented). The TypeScript API freeze candidate
-- [ ] `0.3.0` published, and the consumers' workarounds deleted (`CHANGELOG.md` lists them)
-- [ ] API review across both halves, then `1.0.0`: the Python half, and the TypeScript half
-      republished without a behaviour change
-- [x] Python half written as `0.3.0` (unpublished): parity with TypeScript `0.3.0` except `gated`,
-      a known additive gap for the first Python HTTP consumer
-- [ ] Python `0.3.0` published and validated by its first consumer: a Functions app with Service
-      Bus and timer triggers
+- [x] `0.3.0` published, and the consumers' workarounds deleted (`CHANGELOG.md` lists them)
+- [x] Python half written as `0.3.0`: parity with TypeScript `0.3.0` except `gated`, a known
+      additive gap for the first Python HTTP consumer
+- [x] Python `0.3.0` published and validated by its first consumer: a Functions app with Service
+      Bus and timer triggers. Its findings are `BACKLOG.md` items 26–27
+- [x] API review across both halves (`BACKLOG.md` items 20–27), then `1.0.0`, both halves, API
+      frozen. Published 2026-10-01 on npm and PyPI; `BACKLOG.md` now holds open items only:
+      TypeScript gains two small fixes — a guarded success line
+      (22) and the Python half's refusals of names the environment cannot hold and of NUL values
+      (23); Python writes `hydrate_async`'s lines on the event loop (27); 20, 21, 24 and 25
+      documented, no code change; 26 deferred to `1.1.0`
 - [ ] The Python half's own second consumer
 
 The second consumer's inlined copy of the hydrator is still part of the specification: read it

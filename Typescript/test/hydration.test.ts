@@ -4,7 +4,7 @@
  */
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 import { load } from '@azure/app-configuration-provider';
-import { hydrate, hydrateWithBackoff, resetHydration } from '../src/index';
+import { hydrate, hydrateWithBackoff, hydrationStatus, resetHydration } from '../src/index';
 import { KEYS, VALUES, fakeStore, providerFailoverError, restoreEnv, snapshotEnv } from './helpers';
 
 vi.mock('@azure/app-configuration-provider', () => ({ load: vi.fn() }));
@@ -431,6 +431,37 @@ describe('missing keys', () => {
     expect(process.env).toEqual(before);
   });
 
+  it('refuses a value holding NUL with the missing keys, and writes nothing (1.0.0, item 23)', async () => {
+    // Node truncates a value at NUL without a word, so 'a\0b' would be written as 'a' and reported
+    // as applied.
+    loadMock.mockResolvedValue(fakeStore({ ...VALUES, 'shared:mongoUrl': 'mongodb://a\0b' }) as never);
+
+    const error = await hydrate({ keys: KEYS, retryFloorMs: 0, logger: { log: () => {} } }).catch(
+      (e: unknown) => e
+    );
+
+    expect((error as Error).message).toBe(
+      'Missing key-values in App Configuration: shared:mongoUrl (label prod, holds a NUL character)'
+    );
+    expect(process.env.MONGO_URL).toBeUndefined();
+    expect(process.env.SERVICE_BUS_CONNECTION).toBeUndefined();
+    expect(process.env.HTTP_PORT).toBeUndefined();
+  });
+
+  it('lists a NUL value with the other unusable keys, in key-map order', async () => {
+    loadMock.mockResolvedValue(
+      fakeStore({ 'shared:mongoUrl': 'a\0b', 'shared:serviceBus': VALUES['shared:serviceBus']! }) as never
+    );
+
+    const error = await hydrate({ keys: KEYS, retryFloorMs: 0, logger: { log: () => {} } }).catch(
+      (e: unknown) => e
+    );
+
+    expect((error as Error).message).toBe(
+      'Missing key-values in App Configuration: shared:mongoUrl (label prod, holds a NUL character), myapp:httpPort (label prod, absent or empty)'
+    );
+  });
+
   it('keeps hydrateWithBackoff retrying, and writes only once every key is there', async () => {
     loadMock
       .mockResolvedValueOnce(fakeStore({ 'shared:mongoUrl': VALUES['shared:mongoUrl']! }) as never)
@@ -571,5 +602,119 @@ describe('resetHydration', () => {
     await hydrate({ keys: KEYS });
 
     expect(loadMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+/**
+ * 1.0.0, BACKLOG.md item 22. The success line and the kept line are written after `process.env`
+ * is, so a logger that throws there must not turn a success into a rejection: the environment has
+ * already changed, and a rejection says it has not. Guarded as the failure line is.
+ */
+describe('the success line never changes the outcome', () => {
+  function watchUnhandled() {
+    const unhandled = vi.fn();
+    process.on('unhandledRejection', unhandled);
+    return {
+      unhandled,
+      async settle() {
+        await new Promise(resolve => setTimeout(resolve, 10));
+        process.off('unhandledRejection', unhandled);
+      },
+    };
+  }
+
+  async function expectLoaded(promise: Promise<unknown>) {
+    const result = await promise;
+    expect(result).toMatchObject({ label: 'prod' });
+    expect(process.env.MONGO_URL).toBe(VALUES['shared:mongoUrl']);
+    expect(process.env.SERVICE_BUS_CONNECTION).toBe(VALUES['shared:serviceBus']);
+    // The memo is set: the status says so, and the next call makes no request.
+    expect(hydrationStatus(KEYS).state).toBe('loaded');
+    await expect(hydrate({ keys: KEYS })).resolves.toBe(result);
+    expect(loadMock).toHaveBeenCalledTimes(1);
+  }
+
+  it('resolves when logger.log throws on the success line', async () => {
+    deployed();
+    loadMock.mockResolvedValue(fakeStore() as never);
+    const log = vi.fn(() => {
+      throw new Error('logger down');
+    });
+
+    await expectLoaded(hydrate({ keys: KEYS, logger: { log } }));
+    expect(log).toHaveBeenCalledTimes(1);
+  });
+
+  it('resolves, with nothing unhandled, when an async logger.log rejects on the success line', async () => {
+    deployed();
+    loadMock.mockResolvedValue(fakeStore() as never);
+    const watch = watchUnhandled();
+    // A plain function, not vi.fn(): a mock records a returned promise's outcome, which handles it.
+    let calls = 0;
+    const log = () => {
+      calls++;
+      return Promise.reject(new Error('logger down'));
+    };
+
+    try {
+      await expectLoaded(hydrate({ keys: KEYS, logger: { log: log as never } }));
+    } finally {
+      await watch.settle();
+    }
+    expect(calls).toBe(1);
+    expect(watch.unhandled).not.toHaveBeenCalled();
+  });
+
+  it('resolves when logger.log throws on the kept line', async () => {
+    process.env.HTTP_PORT = '9000';
+    loadMock.mockResolvedValue(fakeStore() as never);
+    const log = vi.fn((line: string) => {
+      if (line.startsWith('Kept from the local environment')) throw new Error('logger down');
+    });
+
+    await expectLoaded(hydrate({ keys: KEYS, logger: { log } }));
+    expect(log).toHaveBeenCalledTimes(2);
+    expect(process.env.HTTP_PORT).toBe('9000');
+  });
+
+  it('loads, writes and memoises when the logger getter throws — and arms no floor', async () => {
+    // The logger is read inside the guard, after the environment is written. Read before the
+    // load, a throwing getter would reject a healthy load and arm the floor having spent nothing
+    // on a failure of its own.
+    deployed();
+    loadMock.mockResolvedValue(fakeStore() as never);
+    let reads = 0;
+    const options = Object.defineProperty({ keys: KEYS }, 'logger', {
+      get() {
+        reads++;
+        throw new Error('logger getter down');
+      },
+    }) as never;
+
+    await expectLoaded(hydrate(options));
+    expect(reads).toBeGreaterThan(0);
+    // No floor: a different key map reaches the store at once.
+    expect(hydrationStatus(KEYS).nextAttemptAt).toBeUndefined();
+    await hydrate({ keys: { 'myapp:httpPort': 'HTTP_PORT' }, logger: { log: () => {} } });
+    expect(loadMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('resolves, with nothing unhandled, when an async logger.log rejects on the kept line', async () => {
+    process.env.HTTP_PORT = '9000';
+    loadMock.mockResolvedValue(fakeStore() as never);
+    const watch = watchUnhandled();
+    const lines: string[] = [];
+    const log = (line: string) => {
+      lines.push(line);
+      return line.startsWith('Kept from the local environment') ? Promise.reject(new Error('logger down')) : undefined;
+    };
+
+    try {
+      await expectLoaded(hydrate({ keys: KEYS, logger: { log: log as never } }));
+    } finally {
+      await watch.settle();
+    }
+    expect(lines).toHaveLength(2);
+    expect(watch.unhandled).not.toHaveBeenCalled();
   });
 });

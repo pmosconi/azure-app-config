@@ -22,9 +22,10 @@ CONFIG = HydrateOptions(
 hydrate(CONFIG)
 ```
 
-> **Status: `0.3.0`, pre-1.0.** It matches the TypeScript `0.3.0` release except for `gated()`,
-> which is not here yet (see [Known gaps](#known-gaps)). `1.0.0` follows an API review across both
-> halves. Python 3.11 or later. See the [root README](https://github.com/pmosconi/azure-app-config/blob/main/README.md) for why each behaviour exists
+> **Status: `1.0.0`. The API is frozen**, together with the TypeScript half's: additions are minor
+> releases, and a change to any of the four invariants, or to a signature, is a major. It matches
+> the TypeScript `1.0.0` release except where [Differences between the halves](#differences-between-the-halves)
+> says otherwise — `gated()` is not here yet. Python 3.11 or later. See the [root README](https://github.com/pmosconi/azure-app-config/blob/main/README.md) for why each behaviour exists
 > and [`CHANGELOG.md`](https://github.com/pmosconi/azure-app-config/blob/main/CHANGELOG.md) for what changed.
 
 Everything else comes from the environment by default:
@@ -96,10 +97,17 @@ hydration can fill it.
 **The logger is per attempt, not per call.** The call that starts an attempt logs it — the
 success line, or one failure line; calls that join it, and memo hits, log nothing. That is why
 every call passes `CONFIG`. The default logger is `logging.getLogger("azure_app_config")`, outside
-the `azure` logger tree on purpose: consumers commonly silence `azure` below WARNING.
+the `azure` logger tree on purpose: consumers commonly silence `azure` below WARNING. From an async
+handler, `hydrate_async` writes the line on the event loop after the `await`, not on the worker
+thread that ran the attempt: the Python worker drops a record written on a pool thread rather than
+attribute it to the invocation.
 
-A logging handler may call `hydrate()`: the lines are written once the attempt is settled, so it
-gets the memoised result or a `ConfigFloorError`. The default credential is created before an
+**A logger must not start a load.** A logging handler may call `hydrate()` or
+`hydration_status()` for the attempt it is logging: the lines are written once the attempt is
+settled, so it gets the memoised result or a `ConfigFloorError`. Anything else from a handler — a
+different key map, or a call after `reset_hydration()` — is a whole new attempt on the logging
+thread, and since `1.0.0` the lines of a `hydrate_async` call are written on the event loop: a
+sync `hydrate()` there blocks the loop, and every other task on it, for up to `timeout_ms`. The default credential is created before an
 attempt starts and outside the package's lock, so a handler on `azure.identity`, which its
 constructor logs to on the calling thread, may call in too; a `hydrate()` from there raises
 `ConfigLoadError` ("creating the default credential"), unlogged, and nothing is attempted for it.
@@ -151,8 +159,9 @@ retry, for a `ConfigInputError`; retry now, for anything else — so branch on
 failed attempt, and logs nothing for a floor rejection. The pattern assumes `retry_floor_ms` sits
 well inside the invocation's timeout, as the 30 s default does.
 
-An **async handler** does the same through `hydrate_async`, which runs `hydrate` on a worker
-thread and shares its memo, floor and in-flight attempt:
+An **async handler** does the same through `hydrate_async`, which runs the attempt on a worker
+thread, shares `hydrate`'s memo, floor and in-flight attempt, and writes its line on the event
+loop:
 
 ```python
 import asyncio
@@ -250,8 +259,8 @@ something was kept, a second line, `Kept from the local environment: …`, names
 
 One attempt, memoised on success against the key map and label. Raises `ConfigLoadError` when
 the store cannot be read, `ConfigInputError` for a call no retry can fix, `ConfigFloorError`
-inside the retry floor, and a `LookupError` naming every key that was absent, empty or not a
-string at that label. All or nothing: a raise leaves `os.environ` as it was.
+inside the retry floor, and a `LookupError` naming every key that was absent, empty, not a string
+or holding NUL at that label. All or nothing: a raise leaves `os.environ` as it was.
 
 Every failure that reached the store arms the floor — a refused or failed read, a missing key, an
 input error raised after the store answered. Input refused before any request leaves it alone.
@@ -269,7 +278,7 @@ changes nothing; a coroutine a logger returns is closed unawaited.
 
 | `HydrateOptions` field | Default | |
 |---|---|---|
-| `keys` | — | **Required.** `{store_key: variable_name}`. No unescaped `*` or `,`; `\*` and `\,` match the literal character |
+| `keys` | — | **Required.** `{store_key: variable_name}`. No unescaped `*` or `,`; `\*` and `\,` match the literal character. No empty key, and no variable name that is empty or contains `=` or NUL: refused before any request |
 | `label` | `APP_CONFIG_LABEL` | Refused if neither is set, or if it holds `*` or `,` |
 | `endpoint` | `APP_CONFIG_ENDPOINT` | |
 | `connection_string` | `APP_CONFIG_CONNECTION_STRING` | Takes precedence when set. Never in the `repr` |
@@ -311,8 +320,14 @@ to about ten seconds each before the first request.
 
 ### `hydrate_async(options) -> HydrationResult` (coroutine)
 
-`hydrate()` on a worker thread via `asyncio.to_thread`: the same memo, floor and in-flight
-attempt. Cancelling the task does not stop an attempt already running.
+The attempt runs on a worker thread via `asyncio.to_thread`, with the same memo, floor and
+in-flight attempt as `hydrate()`; its success or failure line is written on the event loop, after
+the `await`, under the same rules (one per attempt, by the call that started it). Cancelling the
+task does not stop an attempt already running: it completes, its outcome is kept, and its line is
+still written once — on the event loop if the attempt had settled when the cancellation landed,
+otherwise by the worker thread when it settles, since nothing is left on the loop to write it.
+Cancelled while still queued for a worker thread, it never runs. A logger must not start a load:
+see [Azure Functions](#azure-functions).
 
 ### `hydrate_with_backoff(options, backoff: BackoffOptions | None = None) -> HydrationResult`
 
@@ -333,7 +348,10 @@ steps.
 | `ConfigInputError`, whether or not it reached the store | `None` — waiting won't fix it |
 | Anything else | Time until the armed floor opens (by the `retry_floor_ms` of the attempt that armed it), rounded up, plus 50 ms; `None` if open — retry now |
 
-Makes no request.
+Makes no request. A `ConfigFloorError` whose `__cause__` is a `ConfigInputError` with
+`reached_store=True` still gets the floor's wait, on purpose: a fix in the store heals the next
+attempt, and the floor is the right pace for it. On provider 2.5.0 `reached_store` is always
+`False`, so none arises.
 
 ### `hydration_status(keys, label=None) -> HydrationStatus`
 
@@ -388,9 +406,10 @@ store heals the process.
 or 429 now fails the attempt: at the defaults it arrives after about 10 s (the provider benches its
 only client for 30 s, then waits out its startup timeout) and arms the 30 s floor, so the process
 goes about 40 s without configuration. On the TypeScript half the SDK's own retries would usually
-absorb such a blip inside the attempt. What it buys: one request per failure, and an abandoned
-load thread that ends, since azure-core sleeps a `Retry-After` uncapped. If a blip matters more
-than those, the caller retries — the floor and `hydrate_with_backoff` are built for that.
+absorb such a blip inside the attempt, at up to three requests per failure. What it buys: one
+request per failure, and an abandoned load thread that ends, since azure-core sleeps a
+`Retry-After` uncapped. If a blip matters more than those, the caller retries — the floor and
+`hydrate_with_backoff` are built for that. Reviewed for `1.0.0` and kept.
 
 
 Requests, not quota units: on a capped tier each one costs several. The provider also logs its
@@ -437,17 +456,30 @@ is on, and a value one test's `hydrate()` wrote would beat the next test's fake 
 `importlib.reload` the package for fresh state: that makes a second set of error classes that
 `except` clauses elsewhere will not match. Call `reset_hydration()`.
 
-## Known gaps
+## Differences between the halves
 
-- **`gated()`**, the TypeScript half's wrapper that answers 503 with `Retry-After` for an HTTP
-  handler while configuration is not loaded. No Python consumer has HTTP triggers yet; it will be
-  added, additively, with the first one. Until then an HTTP handler does it by hand: on any
-  exception from `hydrate`, answer 503 with `Retry-After: max(1, ceil(retry_after_ms(error) / 1000))`
-  seconds when `retry_after_ms` gives a wait, and without it otherwise.
-- **No dual-build registry, no error brands.** The TypeScript package ships two builds that one
-  process can load, so it keeps its state on `globalThis` and brands its errors. A Python process
-  imports a module once: there is one state and one set of classes by construction.
-- **No async `hydrate_with_backoff`.** See [Long-lived processes](#long-lived-processes).
+Everything not listed here behaves as in the TypeScript half, and the text of every line it logs
+is the same word for word; when and how a logger is called differs as the table says. Each
+difference was reviewed for `1.0.0` and kept.
+
+| | TypeScript | Python | Why |
+|---|---|---|---|
+| The error's cause | `cause` | `__cause__`, on all three error classes; no `cause` attribute | Each language's idiom |
+| A missing or unusable key | a plain `Error` | `LookupError` | The plain-`Error` counterpart, and what an `except` for a lookup expects |
+| The default credential | a new `DefaultAzureCredential` per attempt | one per process, created on first need, reused by every attempt, and dropped — not closed — by `reset_hydration()` | Its token cache and session survive a persistent failure (up to 2,880 attempts a day); closing it would fail an attempt or an abandoned thread still using it |
+| `timeout_ms` | the provider's startup timeout: the call settles at the later of it and the provider's five-second pad | a hard bound on the call: the load runs on a daemon thread, abandoned when the bound fires, and it never writes the environment | Provider 2.5.0 checks its startup timeout only between passes, so a hanging request would hold `load()` far longer |
+| SDK retries inside an attempt | the SDK's defaults: a transient 5xx or 429 is usually absorbed, at up to three requests per failure | none (`retry_total=0`): a single blip fails the attempt and arms the floor — about 40 s without configuration at the defaults — for one request | azure-core sleeps a `Retry-After` uncapped, and not retrying is the only way an abandoned load thread is sure to end. See [What a failure costs](#what-a-failure-costs-on-provider-250) |
+| `hydrate()` from a logging handler on the thread constructing the default credential | no counterpart | raises `ConfigLoadError`, unlogged; nothing is attempted | That call cannot be given a credential, and logging it would re-enter the same handler |
+| An input error from the provider | an argument, type or range error anywhere in the chain; `reachedStore` is defensive | only an argument refused before any network activity, so `reached_store` is always `False`; a Key Vault reference provider 2.5.0 cannot parse is a retryable `ConfigLoadError` naming it, with the stored URI withheld | After a token or a request, the same exception classes come from failures waiting can fix, and an input error stops every retry for good |
+| `gated()` | yes | not yet | No Python consumer has HTTP triggers. It will be added, additively, with the first one; until then, on any exception from `hydrate`, answer 503 with `Retry-After: max(1, ceil(retry_after_ms(error) / 1000))` seconds when `retry_after_ms` gives a wait, and without it otherwise |
+| Sync and async | `hydrate()` returns a promise | `hydrate()` is synchronous and thread-safe; `hydrate_async()` runs it on a worker thread and writes its line on the event loop | Consumers mix sync handlers on the worker's thread pool with async ones |
+| A backoff loop for asyncio | `hydrateWithBackoff()` is async | no async `hydrate_with_backoff`; use `asyncio.to_thread(hydrate_with_backoff, CONFIG)` | See [Long-lived processes](#long-lived-processes): cancelling the task does not stop the thread |
+| The logger | `log` for the success line, `error` (else `log`) for a failure; default `console` | `info` and `error` (else `info`); default `logging.getLogger("azure_app_config")` | Each language's logging idiom; outside the `azure` tree, which consumers silence below WARNING |
+| When the success line is written | inside the attempt, before the memo is set: a logger calling `hydrationStatus` sees `pending`, and one calling `hydrate` joins the attempt it is logging | after the attempt has settled and the memo is set: `hydration_status` says `loaded`, and `hydrate` is a memo hit | A sync call joining its own attempt from the logging thread would wait for ever; a promise joining it does not. The failure line comes after the bookkeeping in both |
+| An async logger | the method is called, so the line is written, and a rejection is swallowed | a coroutine the method returns is closed unawaited, so the line is lost | `hydrate()` is synchronous and cannot await it; pass a sync logger |
+| A logger that raises | anything it throws is swallowed | only an `Exception` is swallowed; a `BaseException` (`KeyboardInterrupt`, `SystemExit`, a cancellation) propagates — after a successful load too, from `hydrate()` or from `hydrate_async` once the environment is written | Swallowing a `BaseException` would hide an interrupt or a shutdown |
+| Two builds in one process | a version-keyed state on `globalThis`, and branded error classes | none | A Python process imports a module once: one state and one set of classes by construction |
+| Shapes | timestamps are `number` milliseconds; results hold arrays | `int` milliseconds; results hold tuples | Immutable results |
 
 ## Development
 

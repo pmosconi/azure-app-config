@@ -1,6 +1,6 @@
 [project]
 name = "actvalue.azure-app-config"
-version = "0.3.0"
+version = "1.0.0"
 description = "Hydrate os.environ from Azure App Configuration, with the failure handling that platform actually needs"
 authors = [{name = "ActValue"}]
 readme = "README.md"
@@ -8,7 +8,7 @@ license = {text = "MIT"}
 requires-python = ">=3.11"
 keywords = ["azure", "app-configuration", "configuration", "key-vault", "environment"]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",

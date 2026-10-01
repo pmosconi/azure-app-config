@@ -1,9 +1,92 @@
 # Changelog
 
-Changes to `@actvalue/azure-app-config`. Until `1.0.0` a minor version may break things; each
-release says what, and which consumer workarounds it lets you delete. The Python half,
-`actvalue.azure-app-config`, matches every behaviour listed here (see the parity rule in
-`CLAUDE.md`) except where its own entry says otherwise.
+Changes to `@actvalue/azure-app-config`. From `1.0.0` the API is frozen: additions are minor
+releases, and a change to any of the four invariants, or to a signature, is a major. Before it a
+minor version could break things; each release says what, and which consumer workarounds it lets
+you delete. The Python half, `actvalue.azure-app-config`, matches every behaviour listed here (see
+the parity rule in `CLAUDE.md`) except where its own entry, or the differences table in
+`Python/README.md`, says otherwise.
+
+## 1.0.0 - released 2026-10-01
+
+Both halves, `@actvalue/azure-app-config` and `actvalue.azure-app-config`, at `1.0.0`. **The API is
+frozen**: nothing is added, removed or renamed in either half, and no signature changes. The
+outcome of the review of `BACKLOG.md` items 20–27, across both halves. The fixes below are the only
+behaviour changes; every other item was settled in the documentation.
+
+### What a consumer changes
+
+Nothing, unless it relied on one of the fixed behaviours:
+
+- [ ] **TypeScript: a key map with an empty key, or a variable name that is empty or contains `=`
+      or NUL, now rejects** with a `ConfigInputError` before any request. Before, Node dropped
+      the write without a word and the variable was reported as applied while reading back
+      `undefined`, so such a map never worked.
+- [ ] **TypeScript: a store value containing NUL now fails the attempt** with the missing keys.
+      Before, Node wrote it cut short at the NUL and reported it as applied.
+
+### TypeScript
+
+- **The success line can no longer turn a success into a failure** (item 22). `logger.log` on the
+  success line and on the `Kept from the local environment` line was called unguarded after
+  `process.env` was written, so a logger that threw made `hydrate()` reject although the
+  environment had changed, and an async logger that rejected left an unhandled rejection. Both
+  lines are now guarded as the failure line is: a throw is swallowed, a returned promise gets a
+  no-op rejection handler, the result is returned and the memo is set. `options.logger` is now
+  read inside the guard too: read before the load, a throwing `logger` getter rejected a healthy
+  load and armed the floor. A synchronous throw ends the
+  lines, as in the Python half. The text of both lines is unchanged.
+- **The Python half's input checks, in TypeScript** (item 23). Refused in `hydrate()` and in
+  `hydrationStatus()`, before any request and without arming the floor: an empty key
+  (`An empty key is not a key: keys must be listed one by one`), and a variable name that is
+  empty or contains `=` or NUL (`Variable name "<name>" for key "<key>" cannot be set in the
+  environment`). A value containing NUL is listed with the other unusable keys, as `<key> (label
+  <label>, holds a NUL character)`, and nothing is written. The messages are the Python half's.
+  `=` in a value, or in a store key, is still fine.
+
+### Python
+
+- **`hydrate_async` writes its lines on the event loop** (item 27). It ran `hydrate` through
+  `asyncio.to_thread`, so the success and failure lines were written on a pool thread, and the
+  Azure Functions Python worker, which does not tie such a record to the invocation, dropped them:
+  the first Python consumer's async Service Bus handler never logged its success line in
+  production. The attempt still runs on the worker thread; its lines are handed back and written
+  after the `await`, on the event loop. The rules are unchanged: one line per attempt, by the call
+  that started it; none for a joiner, a memo hit or a `ConfigFloorError`; a pre-request rejection
+  once per distinct message until `reset_hydration()`; written only once the attempt has settled
+  and the memo is set; a logger that raises changes nothing. **If the awaiting task is cancelled**,
+  the attempt still completes and its outcome is kept, and its line is still written exactly once:
+  on the event loop if the attempt had settled when the cancellation landed, otherwise by the
+  worker thread as it settles; cancelled while still queued, it never runs. `hydrate()` and
+  `hydrate_with_backoff` are unchanged. Internal: no API change. **A logger must not start a
+  load**: from a `hydrate_async` line it runs on the event loop, and a sync `hydrate()` that is not
+  a memo hit or a floor rejection would block the loop for up to `timeout_ms`.
+- The classifier moves from `Development Status :: 4 - Beta` to `5 - Production/Stable`.
+
+### Decided, and documented rather than changed
+
+- **Mock the provider's `load()`, not the exported `hydrate`** (item 20): `gated()` calls the
+  package's own `hydrate`, not the export. One sentence in the README's "Testing a consumer".
+- **`retryAfterMs` for a floor rejection whose cause is an input error keeps the floor's wait**
+  (item 21). A `ConfigFloorError` whose `cause` is a `ConfigInputError` with `reachedStore: true`
+  still gets its `retryAfterMs`, and `gated()` its `Retry-After`: a fix in the store heals the next
+  attempt, and the floor is the right pace for it. In both READMEs and in the JSDoc and docstring.
+  Unreachable from store data on either provider version.
+- **SDK retries stay different** (item 24). The TypeScript half keeps the SDK's retries, which
+  absorb a short blip at up to three requests per failure; the Python half keeps `retry_total=0`,
+  because azure-core sleeps a `Retry-After` uncapped and an abandoned load thread must end. In both
+  READMEs.
+- **Every shape difference is kept** (item 25), and listed in one table, "Differences between the
+  halves", in `Python/README.md` (replacing "Known gaps"), referenced from the root README: the
+  error's cause, `LookupError`, the per-process default credential, `timeout_ms` as a hard bound,
+  the re-entrant call during credential construction, `gated()`, the retry difference, and how a
+  logger is called: when the success line is written relative to the memo, an async logger, and a
+  `BaseException` from a logger.
+
+### Deferred
+
+- **A message-trigger helper** (item 26) is deferred to `1.1.0`. It is additive, so a minor
+  release; the `1.0.0` consumers keep their hand-written recipe.
 
 ## Python 0.3.0 - released 2026-09-29
 

@@ -3,10 +3,10 @@
 Hydrate `process.env` from **Azure App Configuration**, with the failure handling that platform
 actually needs.
 
-> **Pre-1.0.** A minor version may break things until `1.0.0`; the repository's `CHANGELOG.md`
-> says what, and which workarounds each release lets you delete. `0.3.0` is the candidate for the
-> frozen API: `1.0.0` adds a Python half, `actvalue.azure-app-config`, from the same repository,
-> and republishes this one without a behaviour change.
+> **`1.0.0`: the API is frozen.** Additions are minor releases; a change to any of the four
+> invariants, or to a signature, is a major. The repository's `CHANGELOG.md` says what each release
+> changed. A Python half, `actvalue.azure-app-config`, ships from the same repository with the same
+> behaviour; its README lists every difference between the halves.
 
 ```bash
 npm install @actvalue/azure-app-config
@@ -308,8 +308,10 @@ container would otherwise read the production label.
 Returns `{ label, applied, kept, loadedAt }` — which variables were written, which were left
 alone, and when (milliseconds since the epoch). Throws `ConfigLoadError` if the store cannot be
 read, `ConfigInputError` for a call no retry can fix, `ConfigFloorError` inside the retry floor,
-and a plain `Error` naming **every** key that was absent, empty, or not a string at that label.
-All or nothing: a rejection writes nothing to the environment.
+and a plain `Error` naming **every** key that was absent, empty, not a string, or holding NUL at
+that label (Node would truncate it). All or nothing: a rejection writes nothing to the
+environment. An empty key, or a variable name that is empty or contains `=` or NUL — which Node
+drops without a word — is a `ConfigInputError` before any request.
 
 Every failure that reached the store arms the floor, including an input error raised after the
 store had answered. Only input rejected before any request leaves it alone.
@@ -324,8 +326,9 @@ message names the store, the label, the keys or the cause, never a value. Joiner
 `ConfigFloorError` rejections log nothing. A call rejected before any request, by this package or
 by the provider, is logged the same way the first time its message is seen, and not again until
 `resetHydration()`. Build one options object and reuse it: every distinct message is logged, and
-remembered until the reset. A logger that throws changes nothing about the rejection. Concurrent
-calls joining one attempt all receive the **identical rejection object**.
+remembered until the reset. A logger that throws, or rejects, changes nothing: not the rejection,
+and not a success — the environment is written before the success line, so the call still
+resolves. Concurrent calls joining one attempt all receive the **identical rejection object**.
 
 A success is memoised against the `keys`/`label` pair, not globally — one Functions worker hosts
 every function in the app, and a handler declaring its own subset of keys must not be handed
@@ -379,7 +382,9 @@ How long to wait after a rejection from `hydrate()`, in milliseconds. Makes no r
 waiting won't fix it. Anything else: the time until the armed floor opens, by the `retryFloorMs` of
 the attempt that armed it, rounded up, plus the 50 ms margin — `undefined` if it is already open,
 meaning retry now. So `undefined` is "don't retry" for a `ConfigInputError` and "retry now" for
-anything else: tell them apart with `instanceof ConfigInputError`.
+anything else: tell them apart with `instanceof ConfigInputError`. A `ConfigFloorError` whose
+`cause` is a `ConfigInputError` with `reachedStore: true` still gets the floor's wait, on purpose:
+a fix in the store heals the next attempt, and the floor is the right pace for it.
 
 ### `ConfigUnavailableResponse`
 
@@ -391,8 +396,8 @@ Structurally an Azure Functions `HttpResponseInit`.
 What `hydrate()` has done for this key map and label, as
 `{ state: 'loaded' | 'pending' | 'failing' | 'none', loadedAt?, failedAt?, lastError?, nextAttemptAt? }`.
 **Never makes a request and never starts an attempt.** The label resolves as for `hydrate()`.
-Throws `ConfigInputError` for no keys, an unescaped `*` or `,` in a key, no label, or a `*` or `,`
-in the label. It does not check the endpoint or the timing options, and cannot run the provider's
+Throws `ConfigInputError` for no keys, an unescaped `*` or `,` in a key, an empty key, a variable
+name that is empty or contains `=` or NUL, no label, or a `*` or `,` in the label. It does not check the endpoint or the timing options, and cannot run the provider's
 own pre-request checks, so a status of `none` does not promise `hydrate()` will get as far as a
 request.
 
@@ -426,9 +431,10 @@ where one was seen; `observations` lists every distinct failure seen on the wire
 
 ### `ConfigInputError`
 
-A call no retry can fix: an unescaped `*` or `,` in a key, an empty key map, no label, a label with
-`*` or `,`, no endpoint, a timing option that is not a usable number, or input the provider
-rejected as malformed. `hydrateWithBackoff`
+A call no retry can fix: an unescaped `*` or `,` in a key, an empty key map, an empty key, a
+variable name that is empty or contains `=` or NUL, no label, a label with `*` or `,`, no
+endpoint, a timing option that is not a usable number, or input the provider rejected as
+malformed. `hydrateWithBackoff`
 re-throws it instead of looping. `reachedStore` is `false` when it was rejected before a response
 came back from the store — nothing spent, floor not armed — and `true` when the provider rejected
 something after the store answered, which armed the floor like any other failure. On provider
@@ -450,7 +456,8 @@ different versions in one process therefore keep separate state: each has its ow
 
 To run your tests against the real package with only the provider's `load()` mocked, make vitest
 process the package itself, or `vi.mock` of the provider never reaches the package's own import of
-it:
+it. Mock the provider's `load()`, not the exported `hydrate`: `gated()` calls the package's own
+`hydrate` internally, not the export, so a mocked export does not change what the gate does.
 
 ```ts
 // vitest.config.mts

@@ -310,10 +310,15 @@ function currentState(): HydrationState {
  * memo hits and floor rejections log nothing, and every joiner receives the identical rejection
  * object. A call rejected before any request — no endpoint, no label, a filter character, a bad
  * timing option, or an input error the provider raises before its first request — is logged the
- * same way the first time its message is seen, and not again until {@link resetHydration}. The line is the error's message: it names the store, the label, the
- * keys or the cause, never a value. A logger that throws changes nothing about the rejection.
+ * same way the first time its message is seen, and not again until {@link resetHydration}. The
+ * line is the error's message: it names the store, the label, the keys or the cause, never a
+ * value. A logger that throws, or rejects, changes nothing: not the rejection, and not a success —
+ * the environment is written before the success line, so the call still resolves.
  *
- * Nothing is written unless every key is usable: a rejection leaves `process.env` as it was.
+ * Nothing is written unless every key is usable: a rejection leaves `process.env` as it was. A
+ * value holding NUL is unusable (Node would truncate it), and a key or variable name the
+ * environment cannot hold — an empty key, a name that is empty or contains `=` or NUL — is refused
+ * before any request.
  */
 export function hydrate(options: HydrateOptions): Promise<HydrationResult> {
   return hydrateOnce(options, true);
@@ -417,13 +422,16 @@ function reportFailure(options: HydrateOptions | undefined, line: string): void 
   try {
     const target: Logger = options?.logger ?? console;
     const report = target.error ?? target.log;
-    const returned: unknown = report.call(target, line);
-    // Typed void, but a JavaScript logger may be async; its rejection must not go unhandled.
-    const then = (returned as { then?: unknown } | null | undefined)?.then;
-    if (typeof then === 'function') then.call(returned, undefined, () => undefined);
+    ignoreRejection(report.call(target, line));
   } catch {
     // The load's rejection is what the caller needs; a broken logger is not news to add to it.
   }
+}
+
+/** Typed void, but a JavaScript logger may be async: its rejection must not go unhandled. */
+function ignoreRejection(returned: unknown): void {
+  const then = (returned as { then?: unknown } | null | undefined)?.then;
+  if (typeof then === 'function') then.call(returned, undefined, () => undefined);
 }
 
 function messageOf(error: unknown): string {
@@ -443,9 +451,10 @@ function messageOf(error: unknown): string {
  * hours, and no finite floor fixes that across several instances.
  *
  * The label resolves as it does for `hydrate()`: the argument, else `APP_CONFIG_LABEL`. Throws
- * {@link ConfigInputError} for no keys, an unescaped `*` or `,` in a key, no label, or a `*` or `,`
- * in the label — calls there can never be an attempt for. It does not check the endpoint or the
- * timing options, and cannot run the provider's own pre-request checks.
+ * {@link ConfigInputError} for no keys, an unescaped `*` or `,` in a key, an empty key, a variable
+ * name that is empty or contains `=` or NUL, no label, or a `*` or `,` in the label — calls there
+ * can never be an attempt for. It does not check the endpoint or the timing options, and cannot
+ * run the provider's own pre-request checks.
  *
  * `nextAttemptAt` is when the floor opens for the floor of the attempt that armed it — its
  * `retryFloorMs` — exactly, with no margin. `hydrate()` enforces each caller's own `retryFloorMs`,
@@ -494,6 +503,11 @@ export function hydrationStatus(keys: KeyMap, label?: string): HydrationStatus {
  * So `undefined` has two meanings: for a `ConfigInputError`, don't retry; for anything else,
  * retry now. Tell them apart with `instanceof ConfigInputError`, not with this result. For an HTTP
  * `Retry-After` (omitted either way), or a message handler's one wait before its second attempt.
+ *
+ * A floor rejection whose `cause` is a `ConfigInputError` — one with `reachedStore: true`, which
+ * armed the floor — still gets the floor's wait, deliberately (decided in 1.0.0): the input error
+ * may be in the store, a fix there heals the next attempt, and the floor is the right pace for
+ * it. Unreachable from store data on provider 2.6.0.
  */
 export function retryAfterMs(error: unknown): number | undefined {
   if (error instanceof ConfigFloorError) return error.retryAfterMs;
@@ -679,7 +693,7 @@ function planFor(keys: KeyMap, labelOption: string | undefined): Plan {
   if (entries.length === 0) {
     throw new ConfigInputError('hydrate() was called with no keys');
   }
-  for (const [key] of entries) {
+  for (const [key, variable] of entries) {
     // Invariant, enforced rather than documented: one selector per key, never a filter. A
     // wildcard here would reach the provider as a wildcard selector and resolve every Key Vault
     // reference behind it. A comma is the same thing spelled differently — App Configuration
@@ -688,6 +702,16 @@ function planFor(keys: KeyMap, labelOption: string | undefined): Plan {
       throw new ConfigInputError(
         `Key "${key}" is a filter, not a key: unescaped '*' and ',' are not allowed, and keys must be listed one by one, because every Key Vault reference the provider loads it also resolves`
       );
+    }
+    // The SDK sends an empty key filter as `key=`, a filter this package cannot vouch for; a
+    // store key is never empty.
+    if (key === '') {
+      throw new ConfigInputError('An empty key is not a key: keys must be listed one by one');
+    }
+    // Node drops `process.env['']` and `process.env['A=B']` without a word (and a NUL in the name
+    // is no better), so the variable would be reported as applied and read back undefined.
+    if (typeof variable === 'string' && (variable === '' || variable.includes('=') || variable.includes('\0'))) {
+      throw new ConfigInputError(`Variable name "${variable}" for key "${key}" cannot be set in the environment`);
     }
   }
 
@@ -788,8 +812,6 @@ function precedence(option: unknown): { localWins: boolean; reason: string } {
 
 async function attemptHydration(plan: Plan, options: HydrateOptions): Promise<HydrationResult> {
   const { entries, label } = plan;
-  // The logger of the call that started this attempt. Callers that join it log nothing.
-  const logger = options.logger ?? console;
   const config = await loadStore(entries.map(([key]) => key), label, options);
   const { localWins, reason } = precedence(options.localOverridesWin);
 
@@ -821,6 +843,12 @@ async function attemptHydration(plan: Plan, options: HydrateOptions): Promise<Hy
       unusable.push(`${key} (label ${label}, ${typeName(value)} rather than a string)`);
       continue;
     }
+    // Node truncates a value at NUL without a word, so it would be written cut short and reported
+    // as applied.
+    if (value.includes('\0')) {
+      unusable.push(`${key} (label ${label}, holds a NUL character)`);
+      continue;
+    }
 
     writes.push([variable, value]);
   }
@@ -841,14 +869,31 @@ async function attemptHydration(plan: Plan, options: HydrateOptions): Promise<Hy
 
   // One line, names only, never a value. The 0.2.0 prefix is unchanged and the mode follows the
   // list, stated whether or not anything was kept.
-  logger.log(
-    `Configuration loaded from App Configuration, label ${label}: ${applied.join(', ') || 'nothing'} (${localWins ? 'local' : 'store'} wins: ${reason})`
-  );
-  if (kept.length) {
-    logger.log(`Kept from the local environment: ${kept.join(', ')}`);
-  }
+  const lines = [
+    `Configuration loaded from App Configuration, label ${label}: ${applied.join(', ') || 'nothing'} (${localWins ? 'local' : 'store'} wins: ${reason})`,
+  ];
+  if (kept.length) lines.push(`Kept from the local environment: ${kept.join(', ')}`);
+  // Through the logger of the call that started this attempt. Callers that join it log nothing.
+  reportSuccess(options, lines);
 
   return { label, applied, kept, loadedAt: Date.now() };
+}
+
+/**
+ * The success lines, through `log`. Guarded as {@link reportFailure} is: the environment is already
+ * written, so a logger that throws here — or returns a promise that rejects — must not turn the
+ * success into a rejection that says it was not. The logger is read inside the guard too: a
+ * throwing `logger` getter read before the load would reject a healthy one and arm the floor. A
+ * synchronous throw ends the lines, as in the Python half; a rejection is handled and the next
+ * line still goes.
+ */
+function reportSuccess(options: HydrateOptions, lines: string[]): void {
+  try {
+    const logger: Logger = options.logger ?? console;
+    for (const line of lines) ignoreRejection(logger.log(line));
+  } catch {
+    // The environment is written and the result stands; a broken logger is not a failed load.
+  }
 }
 
 async function loadStore(

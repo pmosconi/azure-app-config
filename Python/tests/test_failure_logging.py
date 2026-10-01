@@ -60,6 +60,18 @@ class TestOncePerAttempt:
         assert logger.errors == [f"{PREFIX}{caught.value}"]
         assert logger.infos == []
 
+    def test_writes_the_line_before_the_failure_reaches_the_caller(
+        self, fake_load: FakeLoad
+    ) -> None:
+        fake_load.behaviour = refused()
+        logger = RecordingLogger()
+        seen_by_caller: list[int] = []
+        try:
+            hydrate(options(logger=logger))
+        except ConfigLoadError:
+            seen_by_caller.append(len(logger.errors))
+        assert seen_by_caller == [1]
+
     def test_falls_back_to_info_when_the_logger_has_no_error(self, fake_load: FakeLoad) -> None:
         fake_load.behaviour = refused()
         logger = InfoOnlyLogger()
@@ -306,6 +318,19 @@ class TestHydrateWithBackoffReportsThroughOnErrorAlone:
         with pytest.raises(RuntimeError) as caught:
             hydrate_with_backoff(options(), BackoffOptions(on_error=on_error))
         assert caught.value is own
+
+    def test_still_writes_the_success_line_on_its_own_thread_when_it_succeeds(
+        self, fake_load: FakeLoad, clock: Clock
+    ) -> None:
+        outcomes = [refused(), returns()]
+        fake_load.behaviour = lambda args, kwargs: outcomes.pop(0)(args, kwargs)
+        logger = RecordingLogger()
+        hydrate_with_backoff(
+            options(logger=logger, retry_floor_ms=0), BackoffOptions(on_error=lambda e, d: None)
+        )
+        assert logger.errors == []
+        assert len(logger.infos) == 1
+        assert logger.infos[0].startswith("Configuration loaded from App Configuration, label prod")
 
     def test_does_not_log_the_config_input_error_it_re_raises(self, fake_load: FakeLoad) -> None:
         logger = RecordingLogger()

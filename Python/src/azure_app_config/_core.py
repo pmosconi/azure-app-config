@@ -3,7 +3,8 @@
 Synchronous at the core and thread-safe: one module-level state behind one lock, one attempt in
 flight per key map and label. A caller in another thread that arrives during an attempt waits for
 it and receives the identical exception object, or the memoised success. `hydrate_async` runs the
-same call through `asyncio.to_thread`, so both share one memo and one floor.
+same call through `asyncio.to_thread`, so both share one memo and one floor, and writes the
+attempt's lines itself, on the event loop.
 
 One state per process by construction: a Python process imports a module once, so the dual-build
 registry of the TypeScript half has no counterpart here.
@@ -12,6 +13,7 @@ registry of the TypeScript half has no counterpart here.
 from __future__ import annotations
 
 import asyncio
+import functools
 import inspect
 import json
 import logging
@@ -53,6 +55,10 @@ and the longest single sleep step."""
 DEFAULT_LOGGER_NAME = "azure_app_config"
 """Not under `azure.`: consumers commonly silence that SDK logger tree below WARNING, which would
 swallow the success line."""
+
+
+_Line = Callable[[], None]
+"""One line, ready to write: a call to a guarded report function, which never raises."""
 
 
 def _now_ms() -> int:
@@ -143,16 +149,73 @@ def hydrate(options: HydrateOptions) -> HydrationResult:
 
     Nothing is written unless every key is usable: a raise leaves `os.environ` as it was.
     """
-    return _hydrate_once(options, report_failures=True)
+    return _hydrate_once(options, True, _write_now)
 
 
 async def hydrate_async(options: HydrateOptions) -> HydrationResult:
-    """`hydrate()` for an async caller, on a worker thread via `asyncio.to_thread`.
+    """`hydrate()` for an async caller: the attempt runs on a worker thread via
+    `asyncio.to_thread`, and its success or failure line is written here, on the event loop,
+    after the `await`.
 
-    The same memo, floor and in-flight attempt as `hydrate()`. Cancelling the awaiting task does
-    not stop an attempt already running: it completes, and its outcome is kept for the next call.
+    The same memo, floor and in-flight attempt as `hydrate()`, and the same logging rules: one line
+    per attempt, by the call that started it; none for a joiner, a memo hit or a
+    `ConfigFloorError`; a pre-request rejection once per distinct message. The line is written on
+    the loop because the Azure Functions Python worker does not tie a record written on a pool
+    thread to the invocation, and drops it.
+
+    Cancelling the awaiting task does not stop an attempt already running: it completes, and its
+    outcome is kept for the next call. Its line is still written exactly once: on the event loop if
+    the attempt had settled when the cancellation landed, otherwise by the worker thread as the
+    attempt settles, since nothing is left on the loop to write it. A host that drops pool-thread
+    records may lose that one line; dropping it on purpose would lose it everywhere. Cancelled
+    while still queued for a worker, the call never runs: no attempt, no line, nothing claimed.
+
+    A logger must not start a load. Its lines are written on the event loop, so a handler that
+    calls the sync `hydrate()` for anything but the attempt being logged (a memo hit or a floor
+    rejection) makes a new attempt there, and blocks the loop for up to `timeout_ms`.
     """
-    return await asyncio.to_thread(hydrate, options)
+    handoff = _Handoff()
+    try:
+        return await asyncio.to_thread(_hydrate_for_async, options, handoff)
+    finally:
+        # Normally the attempt's call has returned, so its lines are here. Cancelled, they are here
+        # only if it had already returned; otherwise this tells the thread to write them itself.
+        handoff.collect()
+
+
+class _Handoff:
+    """The lines of one `hydrate_async` call, passed from the worker thread to the event loop.
+    Each line is written once: by `collect()` on the loop, or — when the caller stopped waiting
+    before the call returned — by `deposit()` on the worker thread."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._lines: list[_Line] = []
+        self._collected = False
+
+    def deposit(self, lines: list[_Line]) -> None:
+        """On the worker thread, as the call returns or raises."""
+        with self._lock:
+            if not self._collected:
+                self._lines = lines
+                return
+        _write(lines)
+
+    def collect(self) -> None:
+        """On the event loop, once the caller stops waiting, normally or by cancellation."""
+        with self._lock:
+            self._collected = True
+            lines, self._lines = self._lines, []
+        _write(lines)
+
+
+def _hydrate_for_async(options: HydrateOptions, handoff: _Handoff) -> HydrationResult:
+    """`hydrate()` on the worker thread, with its lines handed to the event loop, not written."""
+    pending: list[_Line] = []
+    try:
+        return _hydrate_once(options, True, pending.append)
+    finally:
+        handoff.deposit(pending)
 
 
 def hydration_status(keys: KeyMap, label: str | None = None) -> HydrationStatus:
@@ -199,6 +262,11 @@ def retry_after_ms(error: BaseException) -> int | None:
 
     So `None` means "don't retry" for a `ConfigInputError` and "retry now" for anything else:
     branch on `isinstance(error, ConfigInputError)`, never on `None`. Makes no request.
+
+    A floor rejection whose `__cause__` is a `ConfigInputError` — one with `reached_store=True`,
+    which armed the floor — still gets the floor's wait, deliberately (decided in 1.0.0): a fix in
+    the store heals the next attempt, and the floor is the right pace for it. Unreachable on
+    provider 2.5.0, where `reached_store` is always `False`.
     """
     if isinstance(error, ConfigFloorError):
         return error.retry_after_ms
@@ -231,7 +299,7 @@ def hydrate_with_backoff(
     delay = initial_ms
     while True:
         try:
-            return _hydrate_once(options, report_failures=False)
+            return _hydrate_once(options, False, _write_now)
         except ConfigInputError:
             raise
         except ConfigFloorError as error:
@@ -319,9 +387,21 @@ def _ensure_default_credential() -> Any:
 # ------------------------------------------------------------------------------------------------
 
 
-def _hydrate_once(options: HydrateOptions, report_failures: bool) -> HydrationResult:
+def _hydrate_once(
+    options: HydrateOptions, report_failures: bool, emit: Callable[[_Line], None]
+) -> HydrationResult:
     """`hydrate()`, with the failure line switched by `report_failures`: `hydrate_with_backoff`
-    passes False, because its `on_error` already reports every failure it sees."""
+    passes False, because its `on_error` already reports every failure it sees.
+
+    Each line it decides — after the attempt has settled and the memo is set, the once-per-message
+    claim made here on the calling thread — goes to `emit`, and the caller decides when it is
+    written: `hydrate()` and `hydrate_with_backoff` pass `_write_now`, so it is written here, before
+    a failure is raised; `hydrate_async` collects them for the event loop.
+
+    A sink rather than a list the caller writes in a `finally`: a joiner re-raises the one shared
+    exception object, and every frame it unwinds adds to that object's traceback while other
+    joiners do the same. With no handler between the raise and the caller, nothing runs on the way
+    out and their frames cannot interleave (`test_joiners_do_not_pile_their_frames…`)."""
     state = _current_state()
     try:
         plan = _validate(options)
@@ -329,7 +409,7 @@ def _hydrate_once(options: HydrateOptions, report_failures: bool) -> HydrationRe
         # Refused before any request, so it neither spends quota nor arms the floor. Not an
         # attempt, but a fail-fast caller would be silent about it, so it is said once per message.
         if report_failures:
-            _report_once_per_message(state, options, error)
+            _report_once_per_message(state, options, error, emit)
         raise
 
     # Before an attempt is registered: see _ensure_default_credential.
@@ -392,16 +472,17 @@ def _hydrate_once(options: HydrateOptions, report_failures: bool) -> HydrationRe
         attempt.error = error
         attempt.traceback = below
         attempt.done.set()
-        # Logged only now, with the attempt settled: a logging handler that calls hydrate() on
-        # this thread must find the outcome, not join an attempt that is waiting for it.
+        # Decided only now, with the attempt settled: a logging handler that calls hydrate() must
+        # find the outcome, not join an attempt that is waiting for it.
         # Once per attempt, whoever else was waiting on it. An input error the provider raised
         # before any request arms no floor, so every call would be a new attempt and a new line:
         # it is a pre-request rejection like _validate()'s, said once per distinct message.
         if report_failures and isinstance(error, Exception):
             if isinstance(error, ConfigInputError) and not error.reached_store:
-                _report_once_per_message(_current_state(), options, error)
+                _report_once_per_message(_current_state(), options, error, emit)
             else:
-                _report_failure(options, f"Configuration load failed: {message_of(error)}")
+                line = f"Configuration load failed: {message_of(error)}"
+                emit(functools.partial(_report_failure, options, line))
         error.__traceback__ = below
         raise error
 
@@ -410,8 +491,8 @@ def _hydrate_once(options: HydrateOptions, report_failures: bool) -> HydrationRe
         record.attempt = None
     attempt.result = result
     attempt.done.set()
-    # After the memo is set, for the same reason: a re-entrant hydrate() is a memo hit.
-    _report_success(options, lines)
+    # Written after the memo is set, for the same reason: a re-entrant hydrate() is a memo hit.
+    emit(functools.partial(_report_success, options, lines))
     return result
 
 
@@ -906,10 +987,25 @@ def _report_success(options: object, lines: list[str]) -> None:
         pass
 
 
-def _report_once_per_message(state: _State, options: object, error: BaseException) -> None:
+def _report_once_per_message(
+    state: _State, options: object, error: BaseException, emit: Callable[[_Line], None]
+) -> None:
+    """Claimed now, on the calling thread, so two calls cannot both claim the message; written
+    when `emit` writes it."""
     line = message_of(error)
     with _lock:
         if line in state.reported_input_errors:
             return
         state.reported_input_errors.add(line)
-    _report_failure(options, f"Configuration load failed: {line}")
+    report = f"Configuration load failed: {line}"
+    emit(functools.partial(_report_failure, options, report))
+
+
+def _write_now(line: _Line) -> None:
+    """The sink of the sync callers: the line is written where it is decided, on this thread."""
+    line()
+
+
+def _write(lines: list[_Line]) -> None:
+    for line in lines:
+        line()

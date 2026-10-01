@@ -11,13 +11,13 @@ npm install @actvalue/azure-app-config       # TypeScript
 pip install actvalue.azure-app-config        # Python — see Python/README.md
 ```
 
-> **Status: pre-1.0.** The TypeScript half is on npm and runs in production in four consumers:
-> three Azure Functions apps and a container web app on App Service. `0.3.0` is the candidate for
-> its frozen API. The Python half is written as `0.3.0`, matching it except for `gated()` (see
-> [`Python/README.md`](Python/README.md)), and awaits its first consumer. `1.0.0` follows an API
-> review across both halves, and republishes the TypeScript half without a behaviour change.
-> Until then a minor version may break things;
-> [`CHANGELOG.md`](CHANGELOG.md) says what, and which workarounds each release lets you delete.
+> **Status: `1.0.0`, both halves. The API is frozen.** The TypeScript half runs in production in
+> four consumers: three Azure Functions apps and a container web app on App Service. The Python
+> half runs in its first, a Functions app with Service Bus and timer triggers. Additions are minor
+> releases; a change to any of the four invariants below, or to a signature, is a major. The
+> halves behave the same except where [the differences between the halves](#the-two-halves) say
+> otherwise. [`CHANGELOG.md`](CHANGELOG.md) says what each release changed, and which workarounds
+> it lets you delete.
 
 ## What it does
 
@@ -384,7 +384,14 @@ read.
 The values must be strings. A key-value with a JSON content type comes back from the provider
 parsed, and the provider's `get<string>()` does not prevent that — so an object would otherwise
 land in the environment as the string `[object Object]`, reported as applied. Those are refused
-by name alongside the absent ones.
+by name alongside the absent ones, and so is a value holding a NUL character, which Node would
+truncate without a word.
+
+The map itself must be one the environment can hold. An empty key is refused (the SDK would send
+it as the filter `key=`, which nobody has verified), and so is a variable name that is empty or
+contains `=` or NUL: Node drops `process.env['']` and `process.env['A=B']` silently, so the
+variable would be reported as applied and read back `undefined`. Both are refused before any
+request. `=` in a value, or in a store key, is fine.
 
 ## API
 
@@ -409,7 +416,8 @@ store.
 Returns `{ label, applied, kept, loadedAt }` — which variables were written, which were left
 alone, and when (milliseconds since the epoch). Throws `ConfigLoadError` if the store cannot be
 read, `ConfigInputError` for a call no retry can fix, `ConfigFloorError` inside the retry floor,
-and a plain `Error` naming every key that was absent, empty, or not a string at that label.
+and a plain `Error` naming every key that was absent, empty, not a string, or holding NUL at that
+label.
 
 All or nothing: every key is checked before anything is written, so a rejection leaves the
 environment exactly as it was.
@@ -437,9 +445,10 @@ rejection again. A call rejected before any request — no endpoint, no label, a
 timing option that is not a usable number, or input the provider refuses before its first request
 — is not an attempt, but it is logged the same way the first time its message is seen, and not
 again until `resetHydration()`. Build one options object and reuse it: every distinct message is
-logged, and remembered until the reset. A logger that throws
-changes nothing: the call rejects with the same error it would have. Attempts that
-`hydrateWithBackoff` starts are reported by its `onError` instead.
+logged, and remembered until the reset. A logger that throws, or returns a promise that rejects,
+changes nothing: a failed call rejects with the same error it would have, and a successful one
+still resolves — the environment is written before the success line, so a throw there must not
+report a failure. Attempts that `hydrateWithBackoff` starts are reported by its `onError` instead.
 
 ### `hydrateWithBackoff(options, backoff?): Promise<HydrationResult>`
 
@@ -486,6 +495,11 @@ Makes no request.
 So `undefined` means "don't retry" for a `ConfigInputError` and "retry now" for anything else: tell
 them apart with `instanceof ConfigInputError`.
 
+A `ConfigFloorError` whose `cause` is a `ConfigInputError` — one with `reachedStore: true`, which
+armed the floor — still gets the floor's wait, and `gated()` still sends its `Retry-After`. That is
+deliberate: such an input error may sit in the store, a fix there heals the next attempt, and the
+floor is the right pace to look again. On provider 2.6.0 no store data produces one.
+
 ### `ConfigUnavailableResponse`
 
 `{ status: 503; body: string; headers?: Record<string, string> }`, what `gated()` answers.
@@ -497,9 +511,9 @@ Structural: it is assignable to an Azure Functions `HttpResponseInit`, without a
 What `hydrate()` has done for this key map and label. **Never makes a request and never starts an
 attempt**, in any state, so a health endpoint can call it on every ping. The label resolves as it
 does for `hydrate()`. Throws `ConfigInputError` for a call `hydrate()` would reject before any
-request: no keys, an unescaped `*` or `,` in a key, no label, or a `*` or `,` in the label. It
-does not check the endpoint or the timing options, and cannot run the provider's own pre-request
-checks.
+request: no keys, an unescaped `*` or `,` in a key, an empty key, a variable name that is empty or
+contains `=` or NUL, no label, or a `*` or `,` in the label. It does not check the endpoint or the
+timing options, and cannot run the provider's own pre-request checks.
 
 Returns `{ state, loadedAt?, failedAt?, lastError?, nextAttemptAt? }`, timestamps in milliseconds
 since the epoch:
@@ -538,9 +552,10 @@ where one was seen; `observations` is every distinct failure seen on the wire du
 
 ### `ConfigInputError`
 
-A call no retry can fix: an unescaped `*` or `,` in a key, an empty key map, no label, a label
-with `*` or `,`, no endpoint, a timing option that is not a usable number, or input the provider
-rejected as malformed. `hydrateWithBackoff`
+A call no retry can fix: an unescaped `*` or `,` in a key, an empty key map, an empty key, a
+variable name that is empty or contains `=` or NUL, no label, a label with `*` or `,`, no
+endpoint, a timing option that is not a usable number, or input the provider rejected as
+malformed. `hydrateWithBackoff`
 re-throws it rather than looping. `reachedStore` says whether a response had already come back from
 the store: `false` means rejected before that, which spent nothing and leaves the retry floor
 alone; `true` means the provider rejected something after the store answered, and that attempt
@@ -582,7 +597,9 @@ export default defineConfig({
 Without it, vitest hands the package to Node untransformed, and `vi.mock` of the provider never
 reaches the package's own import of it: your tests would call the real `load()`. Then mock
 `load()`, which needs to resolve to an object with a `get(key)`, and reset both the package and
-the variables it writes between tests:
+the variables it writes between tests. Mock the provider's `load()`, not the exported `hydrate`:
+`gated()` calls the package's own `hydrate` internally, not the export, so a mocked export does
+not change what the gate does.
 
 ```ts
 import { beforeEach, it, vi } from 'vitest';
@@ -617,6 +634,23 @@ give each file its own global scope.
 **Clear the mapped variables too.** A test runner sets no `WEBSITE_INSTANCE_ID`, so local
 precedence is on, and a value one test's `hydrate()` wrote into `process.env` would beat the next
 test's fake store — delete them (or snapshot and restore `process.env`) beside `resetHydration()`.
+
+## The two halves
+
+The Python half, `actvalue.azure-app-config`, matches this one: the same option names in
+snake_case, the same defaults, the same error semantics, the same four invariants, and the same
+success and failure lines. Where the shapes differ — the error's cause is `__cause__`, a missing
+key raises `LookupError`, `timeout_ms` is a hard bound on the call, there is no `gated()` yet —
+[`Python/README.md`](Python/README.md#differences-between-the-halves) lists every difference in
+one table, with the reason for each.
+
+One of them changes what a short outage costs. **The TypeScript half lets the Azure SDK retry
+inside an attempt; the Python half does not.** Here a single transient 5xx or 429 is usually
+absorbed by the SDK's own retries, at up to three requests per failure. The Python half sets
+`retry_total=0`, because azure-core sleeps a `Retry-After` uncapped and an abandoned load thread
+would otherwise outlive `timeout_ms`; so there a single blip fails the attempt and arms the floor,
+about 40 s without configuration at the defaults, for one request per failure. Both are kept as
+they are.
 
 ## Development
 
