@@ -373,6 +373,40 @@ before `1.0.0` freezes them.
   `ConfigLoadError` in Python; TypeScript has no counterpart.
 - `gated()` exists only in TypeScript until a Python HTTP consumer appears (decided).
 
+### 26. A message-trigger helper: the wait-once recipe is copied into every consumer
+
+**Priority: low. Idea for `1.0.0` or later. Found by the first Python consumer.**
+
+- **Now:** every consumer with message triggers writes the README recipe by hand: re-raise a
+  `ConfigInputError`, otherwise wait `retry_after_ms(error)`, try once more, then let it fail. The
+  first Python consumer needs it twice, sync and async, and the TypeScript message-trigger
+  consumers have their own copies.
+- **Proposal:** a package helper, the message-trigger counterpart of `gated()`, e.g.
+  `hydrate_for_message(options)` / `hydrateForMessage(options)` (plus an async form in Python).
+  The recipe would then be fixed in one place.
+- **Consumer workaround:** the hand-written recipe, in one config module per app.
+
+### 27. Python: `hydrate_async` logs from a worker thread, and the Functions host drops the line
+
+**Priority: medium. Fix in a Python patch. Found by the first Python consumer, in production.**
+
+- **What happened:** an async Service Bus handler on a fresh worker process awaited `hydrate_async`.
+  The load succeeded and the invocation completed, but the success line never reached the host's
+  logs or Application Insights, at any category, although the consumer logs it at WARNING. The same
+  app's sync handlers and timers, calling `hydrate()` on the invocation's own thread, log it every
+  time under `Function.<name>.User`.
+- **Why:** `hydrate_async` is `asyncio.to_thread(hydrate, options)`, so the success or failure line
+  is written on a pool thread. The Python Functions worker evidently does not tie a record from that
+  thread to the invocation, and drops it. The failure line has the same exposure, and it matters
+  more: an async fail-fast consumer that does not log its own exception would be silent.
+- **Proposal:** run the attempt on the pool thread but log on the caller's side. `hydrate_async`
+  collects the attempt's lines and writes them through the logger after the `await`, on the event
+  loop. That is the invocation's own context, as it is for the sync path. The rules stay the same:
+  once per attempt, by the starter, never for joiners.
+- **Consumer workaround:** none needed for correctness. The consumer's handler logs its own
+  exception on failure, and the store's request count shows the load. On async paths, don't rely
+  on the success line.
+
 ## Already open
 
 - ESM/CJS dual state (CLAUDE.md, **Status**, deferred to `1.0.0`). The first consumer is CJS-only and adds nothing new.
